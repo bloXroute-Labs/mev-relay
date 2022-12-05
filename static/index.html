@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width">
+
+    <title>bloXroute MEV relay</title>
+
+    <meta name="description" content="bloXroute MEV relay">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+		<meta name="description" content="bloXroute is the leader in mempool services, block streaming and Defi performance. BDN and DeFi trading tools propagates blockchain transactions fast. Ethereum mempool API, BSC, Polygon and more." />
+		<link rel="canonical" href="https://bloxroute.com/" />
+		<meta property="og:locale" content="en_US" />
+		<meta property="og:type" content="website" />
+		<meta property="og:title" content="bloXroute - DeFi trading tools, Mempool Services, Defi performance" />
+		<meta property="og:description" content="bloXroute is the leader in mempool services, block streaming and Defi performance. BDN and DeFi trading tools propagates blockchain transactions fast. Ethereum mempool API, BSC, Polygon and more." />
+		<meta property="og:url" content="https://bloxroute.com/" />
+		<meta property="og:site_name" content="bloXroute" />
+		<meta property="article:modified_time" content="2022-05-20T17:57:13+00:00" />
+		<meta property="og:image" content="https://bloxroute.com/wp-content/uploads/2021/10/blox-logo-t-300x72.png" />
+		<meta name="twitter:card" content="summary_large_image" />
+
+		<link rel="icon" href="https://bloxroute.com/wp-content/uploads/2021/12/cropped-favicon-32x32-1-32x32.png"/>
+		<link rel="stylesheet" href="static/styles.css"/>
+
+
+</head>
+
+<body>
+	<div class="header">
+		<a href="https://bloxroute.com"><img src="https://bloxroute.com/wp-content/uploads/2021/10/blox-logo-t-300x72.png" /></a>
+	</div>
+    <div class="grids">
+        <div class="content">
+            <p>
+            <h1>
+                bloXroute MEV Relay
+            </h1>
+            <h2>
+                Connection Information
+            </h2>
+						<div class="ctc-field">
+							<input class="copy-to-clipboard" type="text" id="connection" readonly/>
+							<button onClick="ctc('connection')">copy</button>
+						</div>
+            <p>
+            <ul>
+                <li>Pubkey: <span class="value">{{ .Pubkey }}</span></li>
+                <li>Genesis fork version: <span class="value">{{ .GenesisForkVersion }}</span></li>
+                <li>Bellatrix fork version: <span class="value">{{ .BellatrixForkVersion }}</span></li>
+                <li>Genesis validators root: <span class="value">{{ .GenesisValidatorsRoot }}</span></li>
+                <li>Builder signing domain: <span>{{ .BuilderSigningDomain }}</span></li>
+                <li>Proposer signing domain: <span>{{ .ProposerSigningDomain }}</span></li>
+            </ul>
+            </p>
+
+            <p>
+            <h2>
+                Total Validators: {{ .NoValidators }}
+            </h2>
+            </p>
+        </div>
+    </div>
+</body>
+<script>
+	let pubKey = "{{.Pubkey}}";
+	let loc = window.location;
+	let el = document.getElementById("connection")
+	el.value = loc.protocol + "//" + pubKey + "@" + loc.host;
+	el.style.width = el.value.length-5 + "ch"
+
+
+	function ctc(id) {
+		var copyText = document.getElementById(id);
+
+		/* Select the text field */
+		copyText.select();
+		copyText.setSelectionRange(0, 99999); /* For mobile devices */
+
+		/* Copy the text inside the text field */
+		navigator.clipboard.writeText(copyText.value);
+
+		return
+	}
+</script>
+
+</html>

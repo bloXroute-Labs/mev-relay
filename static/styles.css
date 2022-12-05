@@ -1,0 +1,143 @@
+@font-face {
+  font-family: 'Roboto';
+  src: url("/static/Roboto-Regular.ttf");
+}
+@font-face {
+  font-family: 'Roboto';
+  font-weight: bold;
+  src: url("/static/Roboto-Bold.ttf");
+}
+@font-face {
+  font-family: 'Roboto';
+  font-weight: 300;
+  src: url("/static/Roboto-Light.ttf");
+}
+
+* {
+  font-family: 'Roboto';
+}
+
+a {
+  color: white;
+}
+
+html {
+  color: white;
+  min-height: 100vh;
+  background-color: black;
+  background-image: linear-gradient(180deg, #000000 1%, #5D07F526 73%);
+}
+
+.header {
+  height: 55px;
+}
+
+.header img {
+  height: 100%;
+}
+
+body {
+    padding: 10px 40px;
+}
+
+pre {
+    text-align: left;
+}
+
+hr {
+    border-top: 1px solid #e5e5e5;
+    margin: 40px 0;
+}
+
+.copy-to-clipboard {
+  background-color: rgba(255,255,255,0.3);
+  border: none;
+  width: 121ch;
+  color: white;
+  font-weight: bold;
+  padding: 6px 6px;
+  border-radius: 2px 0px 0px 2px;
+  font-size: 15px;
+}
+
+.ctc-field {
+  display: flex;
+}
+
+button {
+  background-color: #1a3e84;
+  color: white;
+  border: none;
+  font-weight: bold;
+  border-radius: 0px 2px 2px 0px;
+  outline: none;
+}
+
+li {
+  font-weight: 300;
+}
+
+li span {
+  font-weight: bold;
+}
+
+button:focus {
+  background-color: #0f2b62;
+  outline: none;
+}
+
+input:focus {
+  outline: none;
+}
+
+
+table th {
+  text-align: center;
+  border-bottom: solid 1px #0B222B;
+  border-top: solid 1px #0B222B;
+  padding: 4px;
+  background-image:  linear-gradient(180deg, #000000 1%, #5D07F526 73%);
+}
+
+th:first-of-type {
+  border-left:  solid 1px #0B222B;
+}
+
+th:last-of-type {
+  border-right:  solid 1px #0B222B;
+}
+
+td:first-child {
+  border-left:  solid 1px #0B222B;
+}
+
+td:last-child {
+  border-right:  solid 1px #0B222B;
+}
+
+td {
+  text-align: left;
+  border-bottom: solid 1px #0B222B;
+  padding: 4px;
+  background-color: black;
+}
+
+tr:hover td {
+  background-color: rgba(255, 255, 255, 0.231);
+}
+
+tr.blxr-built td {
+  background-color: #137cbddb;
+}
+
+table {
+  border-spacing: 0px;
+}
+
+.row {
+  display: flex;
+}
+
+.row table {
+  margin-right: 5px;
+}

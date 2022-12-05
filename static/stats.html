@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width">
+
+    <title>bloXroute MEV relay</title>
+
+    <meta name="description" content="bloXroute MEV relay">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+		<meta name="description" content="bloXroute is the leader in mempool services, block streaming and Defi performance. BDN and DeFi trading tools propagates blockchain transactions fast. Ethereum mempool API, BSC, Polygon and more." />
+		<link rel="canonical" href="https://bloxroute.com/" />
+		<meta property="og:locale" content="en_US" />
+		<meta property="og:type" content="website" />
+		<meta property="og:title" content="bloXroute - DeFi trading tools, Mempool Services, Defi performance" />
+		<meta property="og:description" content="bloXroute is the leader in mempool services, block streaming and Defi performance. BDN and DeFi trading tools propagates blockchain transactions fast. Ethereum mempool API, BSC, Polygon and more." />
+		<meta property="og:url" content="https://bloxroute.com/" />
+		<meta property="og:site_name" content="bloXroute" />
+		<meta property="article:modified_time" content="2022-05-20T17:57:13+00:00" />
+		<meta property="og:image" content="https://bloxroute.com/wp-content/uploads/2021/10/blox-logo-t-300x72.png" />
+		<meta name="twitter:card" content="summary_large_image" />
+
+		<link rel="icon" href="https://bloxroute.com/wp-content/uploads/2021/12/cropped-favicon-32x32-1-32x32.png"/>
+		<link rel="stylesheet" href="static/styles.css"/>
+
+
+</head>
+
+<body>
+	<div class="header">
+		<a href="https://bloxroute.com"><img src="https://bloxroute.com/wp-content/uploads/2021/10/blox-logo-t-300x72.png" /></a>
+	</div>
+    <div class="grids">
+        <div class="content">
+            <p>
+            <h1>
+                bloXroute MEV Relay
+            </h1>
+						<div class="row">
+							<div class="blocks">
+								<h2>Recent Blocks</h2>
+								<table>
+									<tr>
+										<th>Proposer</th>
+										<th>Slot Number</th>
+										<th>Block Number</th>
+										<th># TX</th>
+										<th>Value</th>
+									</tr>
+									{{ .BlockRows }}
+								</table>
+							</div>
+							<div class="blocks">
+								<h2>bloXroute's Best Block for Slot</h2>
+								<table>
+									<tr>
+										<th># TX</th>
+										<th>Value</th>
+										<th>Difference</th>
+										<th></th>
+									</tr>
+									{{ .BXRows }}
+								</table>
+							</div>
+						</div>
+        </div>
+    </div>
+</body>
+</html>
