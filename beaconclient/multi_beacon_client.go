@@ -4,8 +4,11 @@ package beaconclient
 import (
 	"errors"
 	"os"
+	"strings"
 	"sync"
 
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/bloXroute-Labs/mev-relay/common"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/sirupsen/logrus"
 	uberatomic "go.uber.org/atomic"
@@ -20,11 +23,12 @@ var (
 type IMultiBeaconClient interface {
 	BestSyncStatus() (*SyncStatusPayloadData, error)
 	SubscribeToHeadEvents(slotC chan HeadEventData)
+	SubscribeToPayloadAttributes(payloadAttributesChan chan PayloadAttributesData)
 
 	// FetchValidators returns all active and pending validators from the beacon node
 	FetchValidators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
-	PublishBlock(block *types.SignedBeaconBlock) (code int, err error)
+	PublishBlock(block *capella.SignedBeaconBlock) (code int, err error)
 }
 
 // IBeaconInstance is the interface for a single beacon client instance
@@ -32,10 +36,14 @@ type IBeaconInstance interface {
 	SyncStatus() (*SyncStatusPayloadData, error)
 	CurrentSlot() (uint64, error)
 	SubscribeToHeadEvents(slotC chan HeadEventData)
+	SubscribeToPayloadAttributes(payloadAttributesChan chan PayloadAttributesData)
 	FetchValidators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error)
 	GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error)
 	GetURI() string
-	PublishBlock(block *types.SignedBeaconBlock) (code int, err error)
+	GetSlotBlock(slot uint64) (res *common.BeaconBlockMessage, err error)
+
+	GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error)
+	PublishBlock(block *capella.SignedBeaconBlock) (code int, err error)
 }
 
 type MultiBeaconClient struct {
@@ -124,6 +132,14 @@ func (c *MultiBeaconClient) SubscribeToHeadEvents(slotC chan HeadEventData) {
 	}
 }
 
+// SubscribeToPayloadAttributes subscribes to payload_attributes events from all beacon nodes. A single head event will be received multiple times,
+// likely once for every beacon nodes.
+func (c *MultiBeaconClient) SubscribeToPayloadAttributes(payloadAttributesChan chan PayloadAttributesData) {
+	for _, instance := range c.beaconInstances {
+		go instance.SubscribeToPayloadAttributes(payloadAttributesChan)
+	}
+}
+
 func (c *MultiBeaconClient) FetchValidators(headSlot uint64) (map[types.PubkeyHex]ValidatorResponseEntry, error) {
 	// return the first successful beacon node response
 	clients := c.beaconInstancesByLastResponse()
@@ -186,39 +202,111 @@ func (c *MultiBeaconClient) beaconInstancesByLastResponse() []IBeaconInstance {
 	return instances
 }
 
-// PublishBlock publishes the signed beacon block via https://ethereum.github.io/beacon-APIs/#/ValidatorRequiredApi/publishBlock
-func (c *MultiBeaconClient) PublishBlock(block *types.SignedBeaconBlock) (code int, err error) {
-	log := c.log.WithFields(logrus.Fields{
-		"slot":      block.Message.Slot,
-		"blockHash": block.Message.Body.ExecutionPayload.BlockHash.String(),
-	})
-
-	clients := c.beaconInstancesByLastResponse()
-	for _, client := range clients {
-		log := log.WithField("uri", client.GetURI())
-		log.Debug("publishing block")
-
-		if code, err = client.PublishBlock(block); err != nil {
-			log.WithField("statusCode", code).WithError(err).Warn("failed to publish block")
-			continue
-		}
-
-		log.WithField("statusCode", code).Info("published block")
-		return code, nil
-	}
-
-	log.WithField("statusCode", code).WithError(err).Error("failed to publish block on any CL node")
-	return code, err
+type publishResp struct {
+	index int
+	code  int
+	err   error
 }
 
 // GetBeaconNodeURLs returns a list of beacon client URLs ordered by last successful client response
 func (c *MultiBeaconClient) GetBeaconNodeURLs() []string {
 	clients := c.beaconInstancesByLastResponse()
-	urls := make([]string, len(clients), len(clients))
+	urls := make([]string, len(clients))
 
 	for index, client := range clients {
 		urls[index] = client.GetURI()
 	}
 
 	return urls
+}
+
+// GetWithdrawals - 3500/eth/v1/beacon/states/<slot>/withdrawals
+func (c *MultiBeaconClient) GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error) {
+	clients := c.beaconInstancesByLastResponse()
+	for _, client := range clients {
+		log := c.log.WithField("uri", client.GetURI())
+		if withdrawalsResp, err = client.GetWithdrawals(slot); err != nil {
+			if strings.Contains(err.Error(), "Withdrawals not enabled before capella") {
+				break
+			}
+			log.WithField("slot", slot).WithError(err).Warn("failed to get withdrawals")
+			continue
+		}
+
+		return withdrawalsResp, nil
+	}
+
+	if strings.Contains(err.Error(), "Withdrawals not enabled before capella") {
+		c.log.WithField("slot", slot).WithError(err).Debug("failed to get withdrawals as capella has not been reached")
+		return nil, errors.New("cannot fetch withdrawals before capella has been reached")
+	}
+
+	c.log.WithField("slot", slot).WithError(err).Warn("failed to get withdrawals from any CL node")
+	return nil, err
+}
+
+// PublishBlock publishes the signed beacon block via https://ethereum.github.io/beacon-APIs/#/ValidatorRequiredApi/publishBlock
+func (c *MultiBeaconClient) PublishBlock(block *capella.SignedBeaconBlock) (code int, err error) {
+	log := c.log.WithFields(logrus.Fields{
+		"slot":      block.Message.Slot,
+		"blockHash": block.Message.Body.ExecutionPayload.BlockHash.String(),
+	})
+
+	clients := c.beaconInstancesByLastResponse()
+	// The chan will be cleaner up automatically once the function exists even if it was still being written to
+	resChans := make(chan publishResp, len(clients))
+
+	for i, client := range clients {
+		log := log.WithField("uri", client.GetURI())
+		log.Debug("publishing block")
+		go func(index int, client IBeaconInstance) {
+			code, err := client.PublishBlock(block)
+			resChans <- publishResp{
+				index: index,
+				code:  code,
+				err:   err,
+			}
+		}(i, client)
+	}
+
+	var lastErrPublishResp publishResp
+	for i := 0; i < len(clients); i++ {
+		res := <-resChans
+		if res.err != nil {
+			log.WithField("beacon", clients[res.index].GetURI()).WithField("statusCode", res.code).WithError(res.err).Error("failed to publish block")
+			lastErrPublishResp = res
+			continue
+		} else if res.code == 202 {
+			// Should the block fail full validation, a separate success response code (202) is used to indicate that the block was successfully broadcast but failed integration.
+			// https://ethereum.github.io/beacon-APIs/?urls.primaryName=dev#/Beacon/publishBlock
+			log.WithField("beacon", clients[res.index].GetURI()).WithField("statusCode", res.code).WithError(res.err).Error("block failed validation but was still broadcast")
+			lastErrPublishResp = res
+			continue
+		}
+
+		c.bestBeaconIndex.Store(int64(res.index))
+
+		log.WithField("beacon", clients[res.index].GetURI()).WithField("statusCode", res.code).Info("published block")
+		return res.code, nil
+	}
+
+	log.Error("failed to publish block on any CL node")
+	return lastErrPublishResp.code, lastErrPublishResp.err
+}
+
+// GetSlotBlock - /eth/v2/beacon/blocks/<slot>
+func (c *MultiBeaconClient) GetSlotBlock(slot uint64) (res *common.BeaconBlockMessage, err error) {
+	clients := c.beaconInstancesByLastResponse()
+	for _, client := range clients {
+		log := c.log.WithField("uri", client.GetURI())
+		if res, err = client.GetSlotBlock(slot); err != nil {
+			log.WithField("slot", slot).WithError(err).Warn("failed to get randao")
+			continue
+		}
+
+		return res, nil
+	}
+
+	c.log.WithField("slot", slot).WithError(err).Warn("failed to get randao from any CL node")
+	return nil, err
 }

@@ -2,6 +2,12 @@ package database
 
 import (
 	"context"
+	"time"
+
+	"github.com/attestantio/go-builder-client/api"
+	"github.com/attestantio/go-builder-client/api/capella"
+	v1 "github.com/attestantio/go-builder-client/api/v1"
+	capellaapi "github.com/attestantio/go-eth2-client/api/v1/capella"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/stretchr/testify/mock"
 )
@@ -16,8 +22,8 @@ func (db *MockDB) SaveValidatorRegistration(ctx context.Context, registration ty
 	return nil
 }
 
-// SaveBuilderBlockSubmission func
-func (db *MockDB) SaveBuilderBlockSubmission(ctx context.Context, payload *types.BuilderSubmitBlockRequest, simError error, isMostProfitable bool) (id int64, err error) {
+// SaveBuilderBlockSubmissionToDB func
+func (db *MockDB) SaveBuilderBlockSubmissionToDB(ctx context.Context, payload *capella.SubmitBlockRequest, simError error, isMostProfitable bool, receivedAt time.Time) (id int64, err error) {
 	return 0, nil
 }
 
@@ -55,4 +61,14 @@ func (db *MockDB) GetBuilderSubmissions(context context.Context, filters GetBuil
 // SaveDeliveredPayload func
 func (db *MockDB) SaveDeliveredPayload(slot uint64, proposerPubkey types.PubkeyHex, blockHash types.Hash, signedBlindedBeaconBlock *types.SignedBlindedBeaconBlock) error {
 	return nil
+}
+
+// SaveDeliveredPayloadFromProvidedData func
+func (db *MockDB) SaveDeliveredPayloadFromProvidedData(slot uint64, proposerPubkey types.PubkeyHex, blockHash types.Hash, signedBlindedBeaconBlock *capellaapi.SignedBlindedBeaconBlock, bidTrace *v1.BidTrace, getPayloadResponse *api.VersionedExecutionPayload) error {
+	return nil
+}
+
+// GetBlockSubmissionEntryByHash func
+func (db *MockDB) GetBlockSubmissionEntryByHash(ctx context.Context, blockHash string) (entry *BuilderBlockSubmissionEntry, err error) {
+	return nil, nil
 }

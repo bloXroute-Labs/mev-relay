@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/bloXroute-Labs/mev-relay/database"
-	"github.com/bloXroute-Labs/mev-relay/datastore"
 	"github.com/stretchr/testify/assert"
 
 	"github.com/alicebob/miniredis/v2"
@@ -59,48 +58,28 @@ var (
 )
 
 const (
-	redisURI = ":6379"
-	pubKey3  = "0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249"
+	defaultRedisURI  = "localhost:6379"
+	defaultRedisPort = 6379
+	pubKey3          = "0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249"
 )
-
-func saveTestBlockSubmission(t *testing.T, datastore *datastore.Datastore, parentHash types.Hash, proposerPublicKey types.PublicKey, value types.U256Str, slot uint64) {
-	bidTrace := &types.SignedBidTrace{
-		Signature: types.Signature{},
-		Message: &types.BidTrace{
-			Slot:           slot,
-			ProposerPubkey: proposerPublicKey,
-			Value:          value,
-		},
-	}
-
-	getHeaderResponse := &types.GetHeaderResponse{
-		Data: &types.SignedBuilderBid{
-			Message: &types.BuilderBid{
-				Header: &types.ExecutionPayloadHeader{
-					ParentHash:   parentHash,
-					BlockHash:    _HexToHash(testHashHex),
-					FeeRecipient: _HexToAddress(testAddressHex),
-				},
-				Value: value,
-			},
-		},
-	}
-
-	getPayloadResponse := &types.GetPayloadResponse{
-		Data: &types.ExecutionPayload{
-			BlockHash: _HexToHash(testHashHex),
-		},
-	}
-
-	err := datastore.SaveBlockSubmission(bidTrace, getHeaderResponse, getPayloadResponse)
-	assert.Nil(t, err)
-}
 
 func startBeaconServer(t *testing.T) *http.Server {
 	r := mux.NewRouter()
 	r.HandleFunc("/eth/v1/beacon/states/head/validators", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(validValidatorData); err != nil {
+			require.NoError(t, err)
+		}
+	})
+	r.HandleFunc("/eth/v1/beacon/genesis", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]interface{}{
+			"data": map[string]string{
+				"genesis_time":            "1606824023",
+				"genesis_validators_root": "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+				"genesis_fork_version":    "0x00000000",
+			},
+		}); err != nil {
 			require.NoError(t, err)
 		}
 	})
@@ -164,6 +143,14 @@ func startExecutionServer(t *testing.T) *http.Server {
 func startRedis(t *testing.T) {
 	redisClient, err := miniredis.Run()
 	assert.Nil(t, err)
+	redisClient.StartAddr(defaultRedisURI)
+}
+
+func startRedisWithPort(t *testing.T, redisPort int) {
+	redisClient, err := miniredis.Run()
+	assert.Nil(t, err)
+
+	redisURI := fmt.Sprintf("localhost:%v", redisPort)
 	redisClient.StartAddr(redisURI)
 }
 
@@ -175,12 +162,13 @@ func newTestBackendWithBeaconNode(t *testing.T, checkKnown bool, knownValidators
 
 	bn := "http://localhost:8500"
 
-	opts := RelayServiceOpts{
+	opts := BoostServiceOpts{
 		Log:                     testLog,
 		ListenAddr:              "localhost:12345",
 		Relays:                  []RelayEntry{newMockRelay(t, blsPrivateKey).RelayEntry},
 		GenesisForkVersionHex:   "0x00000000",
 		BellatrixForkVersionHex: "0x00000000",
+		CapellaForkVersionHex:   "0x00000000",
 		GenesisValidatorRootHex: "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
 		RelayRequestTimeout:     10 * time.Second,
 		RelayCheck:              true,
@@ -191,10 +179,10 @@ func newTestBackendWithBeaconNode(t *testing.T, checkKnown bool, knownValidators
 		BeaconNode:              bn,
 		CheckKnownValidators:    checkKnown,
 		KnownValidators:         knownValidators,
-		RedisURI:                redisURI,
+		RedisURI:                defaultRedisURI,
 		DB:                      &database.MockDB{},
 	}
-	service, err := NewRelayService(opts)
+	service, err := NewBoostService(opts)
 	require.NoError(t, err)
 
 	backend.boost = service
@@ -210,12 +198,13 @@ func newTestBackendWithBeaconAndExecutionNode(t *testing.T, ttd, mergeEpoch int)
 	bn := "http://localhost:8500"
 	en, _ := url.Parse("http://localhost:8501")
 
-	opts := RelayServiceOpts{
+	opts := BoostServiceOpts{
 		Log:                     testLog,
 		ListenAddr:              "localhost:12345",
 		Relays:                  []RelayEntry{newMockRelay(t, blsPrivateKey).RelayEntry},
 		GenesisForkVersionHex:   "0x00000000",
 		BellatrixForkVersionHex: "0x00000000",
+		CapellaForkVersionHex:   "0x00000000",
 		GenesisValidatorRootHex: "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
 		RelayRequestTimeout:     10 * time.Second,
 		RelayCheck:              true,
@@ -227,10 +216,10 @@ func newTestBackendWithBeaconAndExecutionNode(t *testing.T, ttd, mergeEpoch int)
 		ExecutionNode:           *en,
 		CheckKnownValidators:    false,
 		KnownValidators:         "",
-		RedisURI:                redisURI,
+		RedisURI:                defaultRedisURI,
 		DB:                      &database.MockDB{},
 	}
-	service, err := NewRelayService(opts)
+	service, err := NewBoostService(opts)
 	require.NoError(t, err)
 
 	backend.boost = service
@@ -249,52 +238,6 @@ func TestIsKnownValidator(t *testing.T) {
 	})
 	t.Run("Test isKnownValidator fails for unknown validator", func(t *testing.T) {
 		require.Equal(t, false, backend.boost.isKnownValidator(invalidValidator.Pubkey))
-	})
-	srv.Shutdown(context.Background())
-}
-
-func TestGetHeaderWithCheckKnownValidatorsEnabled(t *testing.T) {
-	getPath := func(slot uint64, parentHash types.Hash, pubkey types.PublicKey) string {
-		return fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), pubkey.String())
-	}
-	srv := startBeaconServer(t)
-	go srv.ListenAndServe()
-	backend := newTestBackendWithBeaconNode(t, true, "")
-	if err := backend.boost.FetchKnownValidators(); err != nil {
-		require.NoError(t, err)
-	}
-
-	t.Run("Test getHeader passes for known validator", func(t *testing.T) {
-		pubkey := _HexToPubkey(validValidatorData.Data[0].Validator.Pubkey)
-		saveTestBlockSubmission(t, backend.boost.datastore, testParentHash, pubkey, types.IntToU256(0), testSlot)
-		path := getPath(1, testParentHash, pubkey)
-		rr := backend.request(t, "GET", path, nil)
-		require.Equal(t, 200, rr.Result().StatusCode)
-	})
-	t.Run("Test getHeader fails for unknown validator", func(t *testing.T) {
-		path2 := getPath(1, testParentHash, testInvalidPubkey)
-		rr2 := backend.request(t, "GET", path2, nil)
-		fmt.Println("PathFail", path2)
-		require.Equal(t, 400, rr2.Result().StatusCode)
-	})
-	srv.Shutdown(context.Background())
-}
-
-func TestGetHeaderWithCheckKnownValidatorsDisabled(t *testing.T) {
-	getPath := func(slot uint64, parentHash types.Hash, pubkey types.PublicKey) string {
-		return fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), pubkey.String())
-	}
-	srv := startBeaconServer(t)
-	go srv.ListenAndServe()
-	backend := newTestBackendWithBeaconNode(t, false, "")
-	if err := backend.boost.FetchKnownValidators(); err != nil {
-		require.NoError(t, err)
-	}
-	t.Run("Test getHeader passes for unknown validator with check disabled", func(t *testing.T) {
-		saveTestBlockSubmission(t, backend.boost.datastore, testParentHash, testInvalidPubkey, types.IntToU256(0), testSlot)
-		path2 := getPath(testSlot, testParentHash, testInvalidPubkey)
-		rr2 := backend.request(t, "GET", path2, nil)
-		require.Equal(t, 200, rr2.Result().StatusCode)
 	})
 	srv.Shutdown(context.Background())
 }
@@ -386,24 +329,6 @@ func TestIsKnownValidatorWithOverride(t *testing.T) {
 	srv.Shutdown(context.Background())
 }
 
-func TestGetHeaderWithCheckKnownValidatorsEnabledAndOverrideSet(t *testing.T) {
-	getPath := func(slot uint64, parentHash types.Hash, pubkey types.PublicKey) string {
-		return fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), pubkey.String())
-	}
-	srv := startBeaconServer(t)
-	go srv.ListenAndServe()
-	t.Run("Test isKnownValidator passes for unknown but overridden validator", func(t *testing.T) {
-		backend := newTestBackendWithBeaconNode(t, true, invalidValidator.Pubkey)
-		if err := backend.boost.FetchKnownValidators(); err != nil {
-			require.NoError(t, err)
-		}
-		path2 := getPath(1, testParentHash, testInvalidPubkey)
-		rr2 := backend.request(t, "GET", path2, nil)
-		require.Equal(t, 200, rr2.Result().StatusCode)
-	})
-	srv.Shutdown(context.Background())
-}
-
 func TestPutRelay(t *testing.T) {
 	token := AuthToken
 	backend := newTestBackend(t, 1, 1, &database.MockDB{})
@@ -431,20 +356,4 @@ func TestPutRelay(t *testing.T) {
 		require.Equal(t, 401, rr.Result().StatusCode)
 		require.Equal(t, 2, len(backend.boost.relays))
 	})
-}
-
-func TestWeiToEth(t *testing.T) {
-	testCasesToExpected := map[string]string{
-		"":                     "0.000000000000000000",
-		"1":                    "0.000000000000000001",
-		"33698629863868639":    "0.033698629863868639",
-		"336986298638686391":   "0.336986298638686391",
-		"3369862986386863912":  "3.369862986386863912",
-		"33698629863868639123": "33.698629863868639123",
-	}
-
-	for testCase, expected := range testCasesToExpected {
-		result := weiToEth(testCase)
-		assert.Equal(t, expected, result)
-	}
 }

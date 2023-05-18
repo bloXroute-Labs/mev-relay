@@ -13,12 +13,28 @@ import (
 	"time"
 
 	"github.com/bloXroute-Labs/gateway/v2/sdnmessage"
+	"github.com/bloXroute-Labs/gateway/v2/types"
 	"github.com/bloXroute-Labs/mev-relay/common"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/patrickmn/go-cache"
 	"github.com/sirupsen/logrus"
 )
 
-const maxConnsPerHost = 5000
+const (
+	maxConnsPerHost = 5000
+	// how much time should middleware wait for the account response
+	authRequestTimeout = time.Second * 5
+	// how much time a process tries to get account info
+	authRequestMaxAttemptTime = time.Minute * 2
+)
+
+var (
+	errNoPermission       = errors.New("your account does not have permissions to use this endpoint")
+	errWrongNumberOfParts = errors.New("wrong number of parts")
+	errWrongHash          = errors.New("id/secret hash is wrong")
+	errMissingAuthHeader  = errors.New("missing auth header")
+	errInvalidAuthHeader  = "invalid auth header"
+)
 
 type Auth struct {
 	log        *logrus.Entry
@@ -31,7 +47,7 @@ type Auth struct {
 
 func NewAuth(log *logrus.Entry, certificatesPath, sdnURL, builderIPs string) Auth {
 	auth := Auth{
-		log:                  log,
+		log:                  log.WithField("middleware", "auth"),
 		builderIPs:           builderIPs,
 		cacheIDToAccountInfo: cache.New(time.Hour, time.Hour),
 	}
@@ -65,122 +81,209 @@ func NewAuth(log *logrus.Entry, certificatesPath, sdnURL, builderIPs string) Aut
 	return auth
 }
 
-func (a Auth) whitelistIPMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if checkThatRequestPassedAuthorization(r.Context()) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		whitelistIP := strings.Contains(a.builderIPs, strings.Split(r.RemoteAddr, ":")[0])
-		if whitelistIP {
-			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authInfoKey, newAuthInfo(whitelistIPAuth))))
-			return
-		}
-
-		if a.authSDNUrl == "" {
-			a.log.WithField("remote-address", r.RemoteAddr).Warn("submit payload from unknown address")
-			respondError(a.log, w, http.StatusUnauthorized, "unauthorized")
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	}
-}
-
-func (a Auth) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if checkThatRequestPassedAuthorization(r.Context()) {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			respondError(a.log, w, http.StatusUnauthorized, "authorization header not found")
-			return
-		}
-
-		accountID, secret, err := a.parseAuthHeader(authHeader)
-		if err != nil {
-			a.log.Errorf("RemoteAddr: %v Request URI: %v Account: %s, failed to parse auth header, %v", r.RemoteAddr, r.RequestURI, accountID, err)
-			respondError(a.log, w, http.StatusUnauthorized, err.Error())
-			return
-		}
-
-		var builderAccount sdnmessage.Account
-
-		account, found := a.cacheIDToAccountInfo.Get(accountID)
-		if found {
-			builderAccount = account.(sdnmessage.Account)
-		} else {
-			builderAccount, err = a.processAccountRequest(accountID)
-			if err != nil {
-				a.log.Errorf("failed to process account %s request %v", accountID, err)
-				respondError(a.log, w, http.StatusUnauthorized, "can not authorize account")
+func (a Auth) whitelistIPMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			log := a.log
+			clientIPAddress := common.GetIPXForwardedFor(r)
+			log.WithField("clientIPAddress", clientIPAddress).WithField("method", "deleteBlocks")
+			if checkThatRequestPassedAuthorization(r.Context()) {
+				next.ServeHTTP(w, r)
 				return
 			}
-		}
 
-		err = a.validateAccount(builderAccount, secret)
-		if err != nil {
-			a.log.Infof("failed to validate account %s, %s", accountID, err.Error())
-			respondError(a.log, w, http.StatusUnauthorized, "your account does not have permissions to use this endpoint")
-			return
-		}
+			whitelistIP := strings.Contains(a.builderIPs, strings.Split(r.RemoteAddr, ":")[0]) || strings.Contains(a.builderIPs, clientIPAddress)
+			if whitelistIP {
+				next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authInfoKey, newAuthInfo(whitelistIPAuth))))
+				return
+			}
 
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authInfoKey, newAuthInfo(headerAuth).addAccountID(accountID))))
-	}
+			if a.authSDNUrl == "" {
+				a.log.WithField("remote-address", r.RemoteAddr).Error("submit payload from unknown address")
+				respondError(log, w, http.StatusUnauthorized, "unauthorized")
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		},
+	)
+}
+
+func (a Auth) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			log := a.log
+			clientIPAddress := common.GetIPXForwardedFor(r)
+			log.WithField("clientIPAddress", clientIPAddress).WithField("method", "deleteBlocks")
+			if checkThatRequestPassedAuthorization(r.Context()) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			accountID, secret, err := a.parseAuthHeader(r.Header.Get("Authorization"))
+			if err != nil {
+				log.Errorf("remote_addr=%v request_uri=%v, failed to parse auth header: %v",
+					r.RemoteAddr, r.RequestURI, err)
+				respondError(log, w, http.StatusUnauthorized, errInvalidAuthHeader)
+				return
+			}
+
+			var builderAccount sdnmessage.Account
+
+			account, found := a.cacheIDToAccountInfo.Get(accountID)
+			if found {
+				builderAccount = account.(sdnmessage.Account)
+			} else {
+				builderAccount, err = a.processAccountRequest(accountID, secret)
+				if err != nil {
+					message := "can not authorize account"
+					if errors.Is(err, errNoPermission) {
+						message = errNoPermission.Error()
+					}
+					respondError(log, w, http.StatusUnauthorized, message)
+					return
+				}
+			}
+
+			next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), authInfoKey,
+				newAuthInfo(headerAuth).addAccountID(accountID).addAccountTier(builderAccount.TierName))))
+		},
+	)
 }
 
 func (a Auth) parseAuthHeader(authHeader string) (accountID string, secret string, err error) {
+	if authHeader == "" {
+		return "", "", errMissingAuthHeader
+	}
 	payload, err := base64.StdEncoding.DecodeString(authHeader)
 	if err != nil {
-		return "", "", fmt.Errorf("could not decode auth header: %v", authHeader)
+		return "", "", err
 	}
 
 	parts := strings.SplitN(string(payload), ":", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("could not decode auth header: %v", authHeader)
+		return "", "", errWrongNumberOfParts
 	}
 
 	return parts[0], parts[1], nil
 }
 
-func (a Auth) processAccountRequest(accountID string) (sdnmessage.Account, error) {
-	res, err := a.client.Get(a.authSDNUrl + accountID)
-	if err != nil {
-		return sdnmessage.Account{}, fmt.Errorf("account request to check authorization failed: %s", err.Error())
+func (a Auth) processAccountRequest(accountID, secret string) (sdnmessage.Account, error) {
+	authResponse := make(chan asyncAuthResponse)
+
+	// get account info on the background
+	go a.getAccount(accountID, authResponse)
+
+	var auth asyncAuthResponse
+	var gotResponse bool
+
+	// wait for the response or timeout
+	select {
+	case <-time.NewTimer(authRequestTimeout).C:
+		// wait for the result on the background
+		go a.waitAndCache(authResponse, accountID, secret)
+	case auth, gotResponse = <-authResponse:
 	}
 
-	defer func(Body io.ReadCloser) {
-		err = Body.Close()
+	// if no response received, make this account elite, but don't add to the cache
+	if !gotResponse {
+		a.log.Warnf("no response received from auth server within %v, assuming account elite", authRequestTimeout)
+		auth.acc.TierName = sdnmessage.ATierElite
+		auth.acc.AccountID = types.AccountID(accountID)
+		return auth.acc, nil
+	}
+
+	// auth server returned an error
+	if auth.err != nil {
+		a.log.Errorf("failed to get account '%s': %v", accountID, auth.err)
+		return sdnmessage.Account{}, auth.err
+	}
+
+	// validate acc secret
+	err := a.validateAccount(auth.acc, secret)
+	if err != nil {
+		a.log.Errorf("failed to validate account %s: %v", accountID, err)
+		return sdnmessage.Account{}, errNoPermission
+	}
+
+	a.log.Infof("saving account %s to cache after receiving response from the sdn", auth.acc.AccountID)
+	a.cacheIDToAccountInfo.Set(string(auth.acc.AccountID), auth.acc, time.Hour)
+	return auth.acc, nil
+}
+
+func (a Auth) getAccount(accountID string, accResp chan asyncAuthResponse) {
+	defer close(accResp)
+
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxElapsedTime = authRequestMaxAttemptTime
+
+	err := backoff.Retry(func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*authRequestTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.authSDNUrl+accountID, nil)
 		if err != nil {
-			a.log.Warnf("body of account %s request to check authorization not closed properly: %v", accountID, err.Error())
+			return backoff.Permanent(fmt.Errorf("failed to create auth request: %w", err))
 		}
-	}(res.Body)
+		res, err := a.client.Do(req)
+		if err != nil {
+			// this is the only non-permanent error
+			return fmt.Errorf("account request to check authorization failed: %w", err)
+		}
+		defer func(r io.ReadCloser) {
+			err = r.Close()
+			if err != nil {
+				a.log.Warnf("failed to close request body of account '%s': %v", accountID, err)
+			}
+		}(res.Body)
 
-	if res.StatusCode != 200 {
-		return sdnmessage.Account{}, fmt.Errorf("the parsed account id/secret hash is wrong; invalid authorization header, status code: %d", res.StatusCode)
-	}
+		if res.StatusCode != http.StatusOK {
+			return backoff.Permanent(fmt.Errorf("invalid authorization header, auth server response status code: %d", res.StatusCode))
+		}
+		var authResponse sdnmessage.Account
+		err = json.NewDecoder(res.Body).Decode(&authResponse)
+		if err != nil {
+			return backoff.Permanent(fmt.Errorf("could not convert body of JSON response to an authResponse struct: %w", err))
+		}
 
-	authResponse := sdnmessage.Account{}
-	err = json.NewDecoder(res.Body).Decode(&authResponse)
+		accResp <- asyncAuthResponse{acc: authResponse}
+		return nil
+	}, bo)
+
 	if err != nil {
-		return sdnmessage.Account{}, fmt.Errorf("could not convert body of JSON response to an authResponse struct: %v", err)
+		accResp <- asyncAuthResponse{err: err}
 	}
+}
 
-	a.cacheIDToAccountInfo.Set(string(authResponse.AccountID), authResponse, time.Hour)
+type asyncAuthResponse struct {
+	acc sdnmessage.Account
+	err error
+}
 
-	return authResponse, nil
+// waitAndCache will wait for the auth server response and add account to the cache if it's valid
+func (a Auth) waitAndCache(authResponse chan asyncAuthResponse, accountID, secret string) {
+	auth, ok := <-authResponse
+	if !ok {
+		return
+	}
+	if auth.err != nil {
+		a.log.WithError(auth.err).Errorf("could not get account info")
+		return
+	}
+	err := a.validateAccount(auth.acc, secret)
+	if err != nil {
+		a.log.Errorf("failed to validate account %s: %v", accountID, err.Error())
+		return
+	}
+	a.log.Infof("saving account %s to cache after receiving response from the sdn", auth.acc.AccountID)
+	a.cacheIDToAccountInfo.Set(string(auth.acc.AccountID), auth.acc, time.Hour)
 }
 
 func (a Auth) validateAccount(account sdnmessage.Account, accountSecret string) error {
 	if account.SecretHash != accountSecret {
-		return errors.New("the parsed account id/secret hash is wrong; invalid authorization header")
+		return errWrongHash
 	}
 
-	if !account.TierName.IsElite() {
+	if !account.TierName.IsEnterprise() {
 		return fmt.Errorf("account %s does not have permissions to use this endpoint, account tier: %s", account.AccountID, account.TierName)
 	}
 
@@ -189,11 +292,12 @@ func (a Auth) validateAccount(account sdnmessage.Account, accountSecret string) 
 
 // TODO: make it generic
 func respondError(log *logrus.Entry, w http.ResponseWriter, code int, message string) {
+	log.WithFields(logrus.Fields{"error": message, "code": code}).Error("responding to client with error")
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	resp := httpErrorResp{code, message}
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.WithField("response", resp).WithError(err).Error("Couldn't write error response")
+		log.WithField("response", resp).WithError(err).Error("couldn't write error response")
 		http.Error(w, "", http.StatusInternalServerError)
 	}
 }

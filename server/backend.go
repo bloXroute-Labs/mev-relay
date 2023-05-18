@@ -21,4 +21,8 @@ var (
 
 	pathBuilderDeleteBlocks             = "/blxr/v1/builder/delete_blocks"
 	pathBuilderDisableGetHeaderResponse = "/blxr/v1/builder/disable_get_header_response"
+
+	pathGetActiveValidators = "/blxr/v1/validators/active"
+
+	pathWebsocket = "/blxr/ws"
 )

@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+
+	"github.com/bloXroute-Labs/gateway/v2/sdnmessage"
 )
 
 type authContextKey string
@@ -16,12 +18,19 @@ const (
 	headerAuth      authContextKey = "header"
 
 	accountIDKey authContextKey = "accountID"
+
+	accountTier authContextKey = "accountTier"
 )
 
 type authInfo map[authContextKey]any
 
 func (a authInfo) addAccountID(accountID string) authInfo {
 	a[accountIDKey] = accountID
+	return a
+}
+
+func (a authInfo) addAccountTier(accTierValue sdnmessage.AccountTier) authInfo {
+	a[accountTier] = accTierValue
 	return a
 }
 

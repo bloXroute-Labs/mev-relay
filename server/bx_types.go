@@ -1,5 +1,10 @@
 package server
 
+import (
+	"strings"
+	"time"
+)
+
 // PutRelayPayload models the payload
 // for the PUT request
 type PutRelayPayload struct {
@@ -37,4 +42,24 @@ type DeleteBidPayload struct {
 	Pubkey      string   `json:"pubkey"`
 	BlockHashes []string `json:"blockHashes"`
 	ParentHash  string   `json:"parentHash"`
+}
+
+type fastestSimulator struct {
+	duration time.Duration
+	nodeURL  string
+}
+
+type simulationResult struct {
+	fastestNodeURL *string
+	duration       time.Duration
+	errors         []error
+}
+
+func (r *simulationResult) error() string {
+	errs := make([]string, len(r.errors))
+	for i := range r.errors {
+		errs[i] = r.errors[i].Error()
+	}
+
+	return strings.Join(errs, ", ")
 }

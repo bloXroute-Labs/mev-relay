@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/sirupsen/logrus"
@@ -8,6 +9,8 @@ import (
 
 // testLog is used to log information in the test methods
 var testLog = logrus.WithField("testing", true)
+var testHighPriorityBuilderPubkeys = syncmap.NewStringMapOf[bool]()
+var testHighPerfSimBuilderPubkeys = syncmap.NewStringMapOf[bool]()
 
 // _HexToBytes converts a hexadecimal string to a byte array
 func _HexToBytes(hex string) []byte {

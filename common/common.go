@@ -9,7 +9,7 @@ import (
 var (
 	ErrServerAlreadyRunning = errors.New("server already running")
 
-	SlotsPerEpoch    = 32
+	SlotsPerEpoch    = uint64(32)
 	DurationPerSlot  = time.Second * 12
 	DurationPerEpoch = DurationPerSlot * time.Duration(SlotsPerEpoch)
 )

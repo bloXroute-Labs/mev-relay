@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	_ "net/http/pprof"
 	"net/url"
@@ -11,15 +12,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
 	"github.com/bloXroute-Labs/mev-relay/database"
-
 	"github.com/bloXroute-Labs/mev-relay/server"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/flashbots/go-boost-utils/bls"
 	"github.com/flashbots/go-boost-utils/types"
+	"github.com/google/uuid"
 	"github.com/sirupsen/logrus"
 	blst "github.com/supranational/blst/bindings/go"
+	"github.com/uptrace/uptrace-go/uptrace"
+	"go.opentelemetry.io/otel"
 )
 
 const (
@@ -41,20 +45,30 @@ var (
 	defaultGenesisForkVersion = getEnv("GENESIS_FORK_VERSION", "")
 	maxHeaderBytes            = getEnvInt("MAX_HEADER_BYTES", 4000) // max header byte size for requests for dos prevention
 
-	listenAddr     = flag.String("addr", defaultListenAddr, "listen-address for server")
+	// cli flags
+	printVersion = flag.Bool("version", false, "only print version")
+
+	listenAddr     = flag.String("addr", defaultListenAddr, "listen-address for mev-boost server")
 	relayURLs      = flag.String("relays", "", "relay urls - single entry or comma-separated list (scheme://pubkey@host)")
 	relayTimeoutMs = flag.Int("request-timeout", defaultRelayTimeoutMs, "timeout for requests to a relay [ms]")
 	relayCheck     = flag.Bool("relay-check", defaultRelayCheck, "check relay status on startup and on the status API call")
 
-	isRelay   = flag.Bool("is-relay", defaultIsRelay, "run as relay and re-sign GetHeader response")
-	secretKey = flag.String("secret-key", "", "private key used for signing messages")
+	isRelay        = flag.Bool("is-relay", defaultIsRelay, "run as relay and re-sign GetHeader response")
+	secretKey      = flag.String("secret-key", "", "private key used for signing messages")
+	fluentdEnabled = flag.Bool("fluentd", false, "should fluentd run")
 
 	// logging flags
-	logJSON          = flag.Bool("json", defaultLogJSON, "log in JSON format instead of text")
-	consoleLevelFlag = flag.String("log-level", "info", "log level for stdout")
+	logJSON           = flag.Bool("json", defaultLogJSON, "log in JSON format instead of text")
+	consoleLevelFlag  = flag.String("log-level", "info", "log level for stdout")
+	fileLevelFlag     = flag.String("log-file-level", "trace", "log level for the log file")
+	fluentdHost       = flag.String("fluentd-host", "http://localhost", "fluentd ip")
+	logMaxSizeFlag    = flag.Int("log-max-size", 100, "maximum size in megabytes of the log file before it gets rotated")
+	logMaxAgeFlag     = flag.Int("log-max-age", 10, "maximum number of days to retain old log files based on the timestamp encoded in their filename")
+	logMaxBackupsFlag = flag.Int("log-max-backups", 10, "maximum number of old log files to retain")
 
 	//
 	nodeID                       = flag.String("node-id", "mev-boost-relay-node-id", "instance id for fluentd")
+	externalIP                   = flag.String("external-ip", "", "external ip")
 	beaconNode                   = flag.String("beacon-node", "http://localhost:5052", "url of the running beacon node")
 	executionNode                = flag.String("execution-node", "http://localhost:8545", "url of the running execution node")
 	beaconChain                  = flag.String("beacon-chain-url", "https://beaconcha.in", "url of the beacon chain for current network")
@@ -62,8 +76,11 @@ var (
 	allowedNonValidators         = flag.String("allowed-non-validators", "", "comma separate list of validator pubkeys to assume known")
 	checkKnownValidatorsDisabled = flag.Bool("disable-known-validator-check", false, "disables check of known validators")
 	bellatrixForkVersion         = flag.String("bellatrix-fork-version", "0x00000000", "bellatrix fork version to display on the landing page")
+	capellaForkVersion           = flag.String("capella-fork-version", "0x00000000", "capella fork version to display on the landing page")
 	genesisValidatorRoot         = flag.String("genesis-validators-root", "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1", "genesis validator root to use for signing domains and landing page")
 	builderIPs                   = flag.String("builder-ips", "127.0.0.1", "csv of allowed builder ips to submit payloads")
+	highPriorityBuilderPubkeys   = flag.String("high-priority-builder-pubkeys", "", "csv of builder public keys whose blocks will skip simulation if value if below a set amount")
+	highPerfSimBuilderPubkeys    = flag.String("high-perf-sim-builder-pubkeys", "", "csv of builder public keys that are allowed to use simulation-nodes-high-perf for block simulation")
 	dbHost                       = flag.String("database", "user=postgres password=password host=127.0.0.1 sslmode=disable", "database connection string")
 	redisURI                     = flag.String("redis", ":6379", "redis connection uri")
 	redisPrefix                  = flag.String("redis-prefix", "mev-boost-relay", "redis prefix string")
@@ -71,9 +88,18 @@ var (
 	sdnURL                       = flag.String("sdn-url", "", "our sdn api url")
 	cetificatesPath              = flag.String("certificates-path", "", "bdn api certificates path")
 	simulationNodes              = flag.String("simulation-nodes", "", "URLs for geth nodes running simulation")
+	simulationNodeHighPerf       = flag.String("simulation-node-high-perf", "", "URL for high performance simulation node, reserved for specific builder public keys")
 	cloudServicesEndpoint        = flag.String("cloud-services-endpoint", "", "cloud services address for sending rpc messages")
 	cloudServicesAuthHeader      = flag.String("cloud-services-auth-header", "", "authorization header to use when sending rpc messages to cloud services")
 	sendSlotProposerDuties       = flag.Bool("send-slot-proposer-duties", false, "send slot proposer duties rpc messages to cloud services")
+	topBlockLimit                = flag.Int("top-block-limit", 3, "number of top blocks to save per slot")
+	externalRelaysForComparison  = flag.String("external-relays-for-comparison", "", "")
+	getPayloadRequestCutoff      = flag.Int("getpayload-request-cutoff", 4000, "getPayload request cutoff time in ms")
+	enableBidSaveCancellation    = flag.Bool("enable-bid-save-cancellation", false, "enables cancellation of saving bids due to later blocks received from the same builder")
+
+	uptraceDSN = flag.String("uptrace-dsn", "", "url for uptrace dsn")
+
+	capellaForkEpoch = flag.Int64("capella-fork-epoch", 0, "")
 
 	// helpers
 	useGenesisForkVersionMainnet = flag.Bool("mainnet", false, "use Mainnet genesis fork version 0x00000000 (for signature validation)")
@@ -81,9 +107,11 @@ var (
 	useGenesisForkVersionRopsten = flag.Bool("ropsten", false, "use Ropsten genesis fork version 0x80000069 (for signature validation)")
 	useGenesisForkVersionSepolia = flag.Bool("sepolia", false, "use Sepolia genesis fork version 0x90000069 (for signature validation)")
 	useCustomGenesisForkVersion  = flag.String("genesis-fork-version", defaultGenesisForkVersion, "use a custom genesis fork version (for signature validation)")
+
+	updateActiveValidators = flag.Bool("update-active-validators", false, "if this relay should manage updating active validators")
 )
 
-var log = logrus.WithField("module", "relay")
+var log = logrus.WithField("module", "cmd/mev-boost")
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -91,6 +119,40 @@ func main() {
 
 	flag.Parse()
 
+	var fluentdNodeID string
+	switch {
+	case *nodeID != "":
+		fluentdNodeID = *nodeID
+	case *externalIP != "":
+		fluentdNodeID = uuid.NewMD5(uuid.NameSpaceDNS, []byte(fmt.Sprintf("%s:%s", *externalIP, *listenAddr))).String()
+	default:
+		uuid, err := uuid.NewUUID()
+		if err != nil {
+			fluentdNodeID = "Unknown-node-id_and_external-ip"
+		} else {
+			fluentdNodeID = uuid.String()
+		}
+	}
+
+	// Configure OpenTelemetry with sensible defaults.
+	uptrace.ConfigureOpentelemetry(
+		uptrace.WithDSN(*uptraceDSN),
+
+		uptrace.WithServiceName("mev-boost-relay"),
+		uptrace.WithServiceVersion("1.0.0"),
+		uptrace.WithDeploymentEnvironment(fluentdNodeID),
+	)
+	// Send buffered spans and free resources.
+	defer uptrace.Shutdown(ctx)
+
+	tracer := otel.Tracer("main")
+
+	server.InitLogger(*consoleLevelFlag, *fileLevelFlag, *fluentdHost, fluentdNodeID, *fluentdEnabled, *logMaxSizeFlag, *logMaxAgeFlag, *logMaxBackupsFlag)
+
+	if *printVersion {
+		fmt.Printf("mev-boost %s\n", version)
+		return
+	}
 	// Set the server version
 	server.Version = version
 
@@ -104,13 +166,7 @@ func main() {
 
 	}
 
-	if *consoleLevelFlag != "" {
-		lvl, err := logrus.ParseLevel(*consoleLevelFlag)
-		if err != nil {
-			log.Fatalf("Invalid loglevel: %s", *consoleLevelFlag)
-		}
-		logrus.SetLevel(lvl)
-	}
+	log.Infof("mev-boost %s", version)
 
 	genesisForkVersionHex := ""
 	if *useCustomGenesisForkVersion != "" {
@@ -188,44 +244,71 @@ func main() {
 		log.WithError(err).Fatal("could not parse etherscan-url")
 	}
 
+	log.Infof("Connecting to Postgres database...")
 	db, err := database.NewDatabaseService(*dbHost)
 	if err != nil {
 		log.Error("could not connect to db, ", "error: ", err)
 	}
+	log.Infof("Connected to Postgres database")
 
-	opts := server.RelayServiceOpts{
-		Log:                     log,
-		ListenAddr:              *listenAddr,
-		Relays:                  relays,
-		GenesisForkVersionHex:   genesisForkVersionHex,
-		RelayRequestTimeout:     relayTimeout,
-		RelayCheck:              *relayCheck,
-		MaxHeaderBytes:          maxHeaderBytes,
-		IsRelay:                 *isRelay,
-		SecretKey:               &boostSecretKey,
-		PubKey:                  pubKey,
-		BeaconNode:              *beaconNode,
-		ExecutionNode:           *executionNodeURL,
-		BeaconChain:             *beaconChainURL,
-		Etherscan:               *etherscanURL,
-		KnownValidators:         *allowedNonValidators,
-		CheckKnownValidators:    !*checkKnownValidatorsDisabled,
-		BellatrixForkVersionHex: *bellatrixForkVersion,
-		GenesisValidatorRootHex: *genesisValidatorRoot,
-		BuilderIPs:              *builderIPs,
-		DB:                      db,
-		RedisURI:                *redisURI,
-		RedisPrefix:             *redisPrefix,
-		SDNURL:                  *sdnURL,
-		CertificatesPath:        *cetificatesPath,
-		SimulationNodes:         *simulationNodes,
-		CloudServicesEndpoint:   *cloudServicesEndpoint,
-		CloudServicesAuthHeader: *cloudServicesAuthHeader,
-		SendSlotProposerDuties:  *sendSlotProposerDuties,
-		RelayType:               getRelayType(*nodeID, *isRelay),
-		RedisPoolSize:           *redisPoolSize,
+	highPriorityBuilderPubkeysMap := syncmap.NewStringMapOf[bool]()
+	if *highPriorityBuilderPubkeys != "" {
+		highPriorityBuilderPubkeysSlice := strings.Split(*highPriorityBuilderPubkeys, ",")
+		for _, pubkey := range highPriorityBuilderPubkeysSlice {
+			highPriorityBuilderPubkeysMap.Store(pubkey, true)
+		}
 	}
-	server, err := server.NewRelayService(opts)
+	highPerfSimBuilderPubkeysMap := syncmap.NewStringMapOf[bool]()
+	if *highPerfSimBuilderPubkeys != "" {
+		highPerfSimBuilderPubkeysSlice := strings.Split(*highPerfSimBuilderPubkeys, ",")
+		for _, pubkey := range highPerfSimBuilderPubkeysSlice {
+			highPerfSimBuilderPubkeysMap.Store(pubkey, true)
+		}
+	}
+
+	opts := server.BoostServiceOpts{
+		Log:                         log,
+		ListenAddr:                  *listenAddr,
+		Relays:                      relays,
+		GenesisForkVersionHex:       genesisForkVersionHex,
+		RelayRequestTimeout:         relayTimeout,
+		RelayCheck:                  *relayCheck,
+		MaxHeaderBytes:              maxHeaderBytes,
+		IsRelay:                     *isRelay,
+		SecretKey:                   &boostSecretKey,
+		PubKey:                      pubKey,
+		BeaconNode:                  *beaconNode,
+		ExecutionNode:               *executionNodeURL,
+		BeaconChain:                 *beaconChainURL,
+		Etherscan:                   *etherscanURL,
+		KnownValidators:             *allowedNonValidators,
+		CheckKnownValidators:        !*checkKnownValidatorsDisabled,
+		BellatrixForkVersionHex:     *bellatrixForkVersion,
+		CapellaForkVersionHex:       *capellaForkVersion,
+		GenesisValidatorRootHex:     *genesisValidatorRoot,
+		BuilderIPs:                  *builderIPs,
+		HighPriorityBuilderPubkeys:  highPriorityBuilderPubkeysMap,
+		HighPerfSimBuilderPubkeys:   highPerfSimBuilderPubkeysMap,
+		DB:                          db,
+		RedisURI:                    *redisURI,
+		RedisPrefix:                 *redisPrefix,
+		SDNURL:                      *sdnURL,
+		CertificatesPath:            *cetificatesPath,
+		SimulationNodes:             *simulationNodes,
+		SimulationNodeHighPerf:      *simulationNodeHighPerf,
+		CloudServicesEndpoint:       *cloudServicesEndpoint,
+		CloudServicesAuthHeader:     *cloudServicesAuthHeader,
+		SendSlotProposerDuties:      *sendSlotProposerDuties,
+		RelayType:                   getRelayType(*nodeID, *isRelay),
+		RedisPoolSize:               *redisPoolSize,
+		TopBlockLimit:               *topBlockLimit,
+		ExternalRelaysForComparison: parseExternalRelaysForComparisonURLs(*externalRelaysForComparison),
+		GetPayloadRequestCutoffMs:   *getPayloadRequestCutoff,
+		CapellaForkEpoch:            *capellaForkEpoch,
+
+		Tracer: tracer,
+	}
+	server, err := server.NewBoostService(opts)
 	if err != nil {
 		log.WithError(err).Fatal("failed creating the server")
 	}
@@ -237,8 +320,22 @@ func main() {
 
 	// TODO: add ctx to all go routine so we can exit nicely
 	go server.StartFetchValidators()
+	if *updateActiveValidators {
+		go server.UpdateActiveValidators()
+	}
 	go server.StartActivityLogger(ctx)
 	go server.SubscribeToBlocks()
+	go server.SubscribeToPayloadAttributes()
+	go server.StartConfigFilesLoading()
+	go server.StartSendNextSlotProposerDuties()
+
+	if *enableBidSaveCancellation {
+		go server.StartSaveBlocksPubSub()
+	}
+
+	if *fluentdEnabled {
+		server.StartStats(*fluentdHost, fluentdNodeID)
+	}
 
 	if *relayCheck && !server.CheckRelays() {
 		log.Fatal("no relay available")
@@ -275,6 +372,15 @@ func parseRelayURLs(relayURLs string) []server.RelayEntry {
 		ret = append(ret, relay)
 	}
 	return ret
+}
+
+func parseExternalRelaysForComparisonURLs(relayURLs string) []string {
+	urls := strings.Split(relayURLs, ",")
+	if len(urls) == 1 && urls[0] == "" {
+		return []string{}
+	}
+
+	return urls
 }
 
 func getRelayType(nodeID string, isRelay bool) server.RelayType {

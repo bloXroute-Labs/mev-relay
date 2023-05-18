@@ -2,13 +2,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 
-	"github.com/flashbots/go-boost-utils/types"
+	"github.com/bloXroute-Labs/mev-relay/common"
 	"github.com/flashbots/go-utils/jsonrpc"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 var (
@@ -16,9 +17,10 @@ var (
 	ErrSimulationFailed = errors.New("simulation failed")
 )
 
-func sendSim(payload *types.BuilderSubmitBlockRequest, executionNodeURL string) error {
-	simReq := jsonrpc.NewJSONRPCRequest("1", "flashbots_validateBuilderSubmissionV1", payload)
-	simResp, err := SendJSONRPCRequest(*simReq, executionNodeURL)
+func sendSim(ctx context.Context, payload *common.BuilderBlockValidationRequest, executionNodeURL string) error {
+	method := "flashbots_validateBuilderSubmissionV2"
+	simReq := jsonrpc.NewJSONRPCRequest("1", method, payload)
+	simResp, err := SendJSONRPCRequest(ctx, *simReq, executionNodeURL)
 	if err != nil {
 		return err
 	} else if simResp.Error != nil {
@@ -29,24 +31,17 @@ func sendSim(payload *types.BuilderSubmitBlockRequest, executionNodeURL string) 
 }
 
 // SendJSONRPCRequest sends the request to URL and returns the general JsonRpcResponse, or an error (note: not the JSONRPCError)
-func SendJSONRPCRequest(req jsonrpc.JSONRPCRequest, url string) (res *jsonrpc.JSONRPCResponse, err error) {
+func SendJSONRPCRequest(ctx context.Context, req jsonrpc.JSONRPCRequest, url string) (res *jsonrpc.JSONRPCResponse, err error) {
 	buf, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(buf))
+	resp, err := otelhttp.Post(ctx, url, "application/json", bytes.NewReader(buf))
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq.Header.Add("Content-Type", "application/json")
-
-	// execute request
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
 	defer resp.Body.Close()
 
 	res = new(jsonrpc.JSONRPCResponse)
