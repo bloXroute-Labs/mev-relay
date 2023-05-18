@@ -7,39 +7,37 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
 	"os"
 	"strings"
 	"time"
 
+	"github.com/attestantio/go-builder-client/api"
+	"github.com/attestantio/go-builder-client/api/capella"
+	v1 "github.com/attestantio/go-builder-client/api/v1"
+	capellaapi "github.com/attestantio/go-eth2-client/api/v1/capella"
 	"github.com/bloXroute-Labs/mev-relay/common"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 )
 
-const databaseRequestTimeout = time.Second * 12
+var (
+	saveDeliveredPayloadTimeout = time.Second * 30
+)
 
 // IDatabaseService db
 type IDatabaseService interface {
-	//+
 	SaveValidatorRegistration(ctx context.Context, registration types.SignedValidatorRegistration) error
-	SaveBuilderBlockSubmission(ctx context.Context, payload *types.BuilderSubmitBlockRequest, simError error, isMostProfitable bool) (id int64, err error)
-	//+
+	SaveBuilderBlockSubmissionToDB(ctx context.Context, payload *capella.SubmitBlockRequest, simError error, isMostProfitable bool, receivedAt time.Time) (id int64, err error)
 	SaveDeliveredPayload(slot uint64, proposerPubkey types.PubkeyHex, blockHash types.Hash, signedBlindedBeaconBlock *types.SignedBlindedBeaconBlock) error
-	//+
 	GetBlockSubmissionEntry(ctx context.Context, slot uint64, proposerPubkey, blockHash string) (entry *BuilderBlockSubmissionEntry, err error)
-	//+
 	GetExecutionPayloadEntryByID(ctx context.Context, executionPayloadID int64) (entry *ExecutionPayloadEntry, err error)
-	//+
 	GetExecutionPayloadEntryBySlotPkHash(ctx context.Context, slot uint64, blockHash string) (entry *ExecutionPayloadEntry, err error)
-
-	//+
 	GetRecentDeliveredPayloads(filters GetPayloadsFilters) ([]*DeliveredPayloadEntry, error)
-	//+
 	GetNumDeliveredPayloads(ctx context.Context) (uint64, error)
-	//+
 	GetBuilderSubmissions(ctx context.Context, filters GetBuilderSubmissionsFilters) ([]*BuilderBlockSubmissionEntry, error)
+	GetBlockSubmissionEntryByHash(ctx context.Context, blockHash string) (entry *BuilderBlockSubmissionEntry, err error)
+	SaveDeliveredPayloadFromProvidedData(slot uint64, proposerPubkey types.PubkeyHex, blockHash types.Hash, signedBlindedBeaconBlock *capellaapi.SignedBlindedBeaconBlock, bidTrace *v1.BidTrace, getPayloadResponse *api.VersionedExecutionPayload) error
 }
 
 // DatabaseService db
@@ -54,8 +52,8 @@ func NewDatabaseService(dsn string) (*DatabaseService, error) {
 		return nil, err
 	}
 
-	db.DB.SetMaxOpenConns(100)
-	db.DB.SetMaxIdleConns(10)
+	db.DB.SetMaxOpenConns(200)
+	db.DB.SetMaxIdleConns(50)
 	db.DB.SetConnMaxIdleTime(120 * time.Second)
 
 	if os.Getenv("PRINT_SCHEMA") == "1" {
@@ -106,27 +104,9 @@ func (s *DatabaseService) SaveValidatorRegistration(ctx context.Context, registr
 	return nil
 }
 
-// SaveBuilderBlockSubmission db func
-func (s *DatabaseService) SaveBuilderBlockSubmission(ctx context.Context, payload *types.BuilderSubmitBlockRequest, simError error, isMostProfitable bool) (id int64, err error) {
-	// Save execution_payload: insert, or if already exists update to be able to return the id ('on conflict do nothing' doesn't return an id)
-	execPayloadEntry, err := PayloadToExecPayloadEntry(payload)
-	if err != nil {
-		return 0, err
-	}
-	query := `INSERT INTO ` + TableExecutionPayload + `
-	(slot, proposer_pubkey, block_hash, version, payload) VALUES
-	(:slot, :proposer_pubkey, :block_hash, :version, :payload)
-	ON CONFLICT (slot, proposer_pubkey, block_hash) DO UPDATE SET slot=:slot
-	RETURNING id`
-	nstmt, err := s.DB.PrepareNamed(query)
-	if err != nil {
-		return 0, err
-	}
-	err = nstmt.QueryRowContext(ctx, execPayloadEntry).Scan(&execPayloadEntry.ID)
-	if err != nil {
-		return 0, err
-	}
-
+// SaveBuilderBlockSubmissionToDB db func
+func (s *DatabaseService) SaveBuilderBlockSubmissionToDB(ctx context.Context, payload *capella.SubmitBlockRequest, simError error, isMostProfitable bool, receivedAt time.Time) (id int64, err error) {
+	//TODO: context is unused
 	// Save block_submission
 	simErrStr := ""
 	if simError != nil {
@@ -134,7 +114,7 @@ func (s *DatabaseService) SaveBuilderBlockSubmission(ctx context.Context, payloa
 	}
 
 	blockSubmissionEntry := &BuilderBlockSubmissionEntry{
-		ExecutionPayloadID: NewNullInt64(execPayloadEntry.ID),
+		InsertedAt: receivedAt,
 
 		SimSuccess: simError == nil,
 		SimError:   simErrStr,
@@ -153,17 +133,17 @@ func (s *DatabaseService) SaveBuilderBlockSubmission(ctx context.Context, payloa
 		GasLimit: payload.Message.GasLimit,
 
 		NumTx: len(payload.ExecutionPayload.Transactions),
-		Value: payload.Message.Value.String(),
+		Value: payload.Message.Value.ToBig().String(),
 
 		Epoch:             payload.Message.Slot / uint64(common.SlotsPerEpoch),
 		BlockNumber:       payload.ExecutionPayload.BlockNumber,
 		WasMostProfitable: isMostProfitable,
 	}
-	query = `INSERT INTO ` + TableBuilderBlockSubmission + `
-	(execution_payload_id, sim_success, sim_error, signature, slot, parent_hash, block_hash, builder_pubkey, proposer_pubkey, proposer_fee_recipient, gas_used, gas_limit, num_tx, value, epoch, block_number, was_most_profitable) VALUES
-	(:execution_payload_id, :sim_success, :sim_error, :signature, :slot, :parent_hash, :block_hash, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :gas_used, :gas_limit, :num_tx, :value, :epoch, :block_number, :was_most_profitable)
+	query := `INSERT INTO ` + TableBuilderBlockSubmission + `
+	(inserted_at, execution_payload_id, sim_success, sim_error, signature, slot, parent_hash, block_hash, builder_pubkey, proposer_pubkey, proposer_fee_recipient, gas_used, gas_limit, num_tx, value, epoch, block_number, was_most_profitable) VALUES
+	(:inserted_at, :execution_payload_id, :sim_success, :sim_error, :signature, :slot, :parent_hash, :block_hash, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :gas_used, :gas_limit, :num_tx, :value, :epoch, :block_number, :was_most_profitable)
 	RETURNING id`
-	nstmt, err = s.DB.PrepareNamed(query)
+	nstmt, err := s.DB.PrepareNamed(query)
 	if err != nil {
 		return 0, err
 	}
@@ -187,6 +167,18 @@ func (s *DatabaseService) GetBlockSubmissionEntry(ctx context.Context, slot uint
 	return entry, err
 }
 
+// GetBlockSubmissionEntryByHash db func
+func (s *DatabaseService) GetBlockSubmissionEntryByHash(ctx context.Context, blockHash string) (entry *BuilderBlockSubmissionEntry, err error) {
+	query := `SELECT id, inserted_at, execution_payload_id, sim_success, sim_error, signature, slot, parent_hash, block_hash, builder_pubkey, proposer_pubkey, proposer_fee_recipient, gas_used, gas_limit, num_tx, value, epoch, block_number
+	FROM ` + TableBuilderBlockSubmission + `
+	WHERE block_hash=$1
+	ORDER BY builder_pubkey ASC
+	LIMIT 1`
+	entry = &BuilderBlockSubmissionEntry{}
+	err = s.DB.GetContext(ctx, entry, query, blockHash)
+	return entry, err
+}
+
 // GetExecutionPayloadEntryByID db func
 func (s *DatabaseService) GetExecutionPayloadEntryByID(ctx context.Context, executionPayloadID int64) (entry *ExecutionPayloadEntry, err error) {
 	query := `SELECT id, inserted_at, slot, proposer_pubkey, block_hash, version, payload FROM ` + TableExecutionPayload + ` WHERE id=$1`
@@ -207,7 +199,7 @@ func (s *DatabaseService) GetExecutionPayloadEntryBySlotPkHash(ctx context.Conte
 
 // SaveDeliveredPayload db func
 func (s *DatabaseService) SaveDeliveredPayload(slot uint64, proposerPubkey types.PubkeyHex, blockHash types.Hash, signedBlindedBeaconBlock *types.SignedBlindedBeaconBlock) error {
-	ctx, cancel := context.WithTimeout(context.Background(), databaseRequestTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), saveDeliveredPayloadTimeout)
 	defer cancel()
 	blockSubmissionEntry, err := s.GetBlockSubmissionEntry(ctx, slot, proposerPubkey.String(), blockHash.String())
 	if err != nil {
@@ -249,14 +241,54 @@ func (s *DatabaseService) SaveDeliveredPayload(slot uint64, proposerPubkey types
 	return err
 }
 
+// SaveDeliveredPayloadFromProvidedData db func
+func (s *DatabaseService) SaveDeliveredPayloadFromProvidedData(slot uint64, proposerPubkey types.PubkeyHex, blockHash types.Hash, signedBlindedBeaconBlock *capellaapi.SignedBlindedBeaconBlock, bidTrace *v1.BidTrace, getPayloadResponse *api.VersionedExecutionPayload) error {
+	ctx, cancel := context.WithTimeout(context.Background(), saveDeliveredPayloadTimeout)
+	defer cancel()
+	_signedBlindedBeaconBlock, err := json.Marshal(signedBlindedBeaconBlock)
+	if err != nil {
+		return err
+	}
+
+	deliveredPayloadEntry := DeliveredPayloadEntry{
+		ExecutionPayloadID:       sql.NullInt64{},
+		SignedBlindedBeaconBlock: NewNullString(string(_signedBlindedBeaconBlock)),
+
+		Slot:  slot,
+		Epoch: slot / 32,
+
+		BuilderPubkey:        bidTrace.BuilderPubkey.String(),
+		ProposerPubkey:       proposerPubkey.String(),
+		ProposerFeeRecipient: bidTrace.ProposerFeeRecipient.String(),
+
+		ParentHash:  getPayloadResponse.Capella.ParentHash.String(),
+		BlockHash:   getPayloadResponse.Capella.BlockHash.String(),
+		BlockNumber: getPayloadResponse.Capella.BlockNumber,
+
+		GasUsed:  getPayloadResponse.Capella.GasUsed,
+		GasLimit: getPayloadResponse.Capella.GasLimit,
+
+		NumTx: len(getPayloadResponse.Capella.Transactions),
+		Value: bidTrace.Value.ToBig().String(),
+	}
+
+	query := `INSERT INTO ` + TableDeliveredPayload + `
+		(execution_payload_id, signed_blinded_beacon_block, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, gas_used, gas_limit, num_tx, value) VALUES
+		(:execution_payload_id, :signed_blinded_beacon_block, :slot, :epoch, :builder_pubkey, :proposer_pubkey, :proposer_fee_recipient, :parent_hash, :block_hash, :block_number, :gas_used, :gas_limit, :num_tx, :value)
+		ON CONFLICT DO NOTHING`
+	_, err = s.DB.NamedExecContext(ctx, query, deliveredPayloadEntry)
+	return err
+}
+
 // GetRecentDeliveredPayloads db func
 func (s *DatabaseService) GetRecentDeliveredPayloads(filters GetPayloadsFilters) ([]*DeliveredPayloadEntry, error) {
 	arg := map[string]interface{}{
-		"limit":        filters.Limit,
-		"slot":         filters.Slot,
-		"cursor":       filters.Cursor,
-		"block_hash":   filters.BlockHash,
-		"block_number": filters.BlockNumber,
+		"limit":          filters.Limit,
+		"slot":           filters.Slot,
+		"cursor":         filters.Cursor,
+		"block_hash":     filters.BlockHash,
+		"block_number":   filters.BlockNumber,
+		"builder_pubkey": filters.BuilderPubkey,
 	}
 
 	tasks := []*DeliveredPayloadEntry{}
@@ -273,6 +305,9 @@ func (s *DatabaseService) GetRecentDeliveredPayloads(filters GetPayloadsFilters)
 	}
 	if filters.BlockNumber > 0 {
 		whereConds = append(whereConds, "block_number = :block_number")
+	}
+	if filters.BuilderPubkey != "" {
+		whereConds = append(whereConds, "builder_pubkey = :builder_pubkey")
 	}
 
 	where := ""
@@ -299,34 +334,41 @@ func (s *DatabaseService) GetNumDeliveredPayloads(ctx context.Context) (uint64, 
 // GetBuilderSubmissions db func
 func (s *DatabaseService) GetBuilderSubmissions(ctx context.Context, filters GetBuilderSubmissionsFilters) ([]*BuilderBlockSubmissionEntry, error) {
 	arg := map[string]interface{}{
-		"limit":        filters.Limit,
-		"slot":         filters.Slot,
-		"block_hash":   filters.BlockHash,
-		"block_number": filters.BlockNumber,
+		"limit":          filters.Limit,
+		"slot":           filters.Slot,
+		"block_hash":     filters.BlockHash,
+		"block_number":   filters.BlockNumber,
+		"builder_pubkey": filters.BuilderPubkey,
 	}
 
 	tasks := []*BuilderBlockSubmissionEntry{}
 	fields := "id, inserted_at, slot, epoch, builder_pubkey, proposer_pubkey, proposer_fee_recipient, parent_hash, block_hash, block_number, num_tx, value, gas_used, gas_limit"
+	limit := "LIMIT :limit"
 
 	whereConds := []string{
 		"sim_success = true",
-		"was_most_profitable = true",
 	}
 	if filters.Slot > 0 {
 		whereConds = append(whereConds, "slot = :slot")
+		limit = "" // remove the limit when filtering by slot
 	}
 	if filters.BlockHash != "" {
 		whereConds = append(whereConds, "block_hash = :block_hash")
+		limit = "" // remove the limit when filtering by block_hash
 	}
 	if filters.BlockNumber > 0 {
 		whereConds = append(whereConds, "block_number = :block_number")
+		limit = "" // remove the limit when filtering by block_number
+	}
+	if filters.BuilderPubkey != "" {
+		whereConds = append(whereConds, "builder_pubkey = :builder_pubkey")
 	}
 
 	where := ""
 	if len(whereConds) > 0 {
 		where = "WHERE " + strings.Join(whereConds, " AND ")
 	}
-	nstmt, err := s.DB.PrepareNamed(fmt.Sprintf("SELECT %s FROM %s %s ORDER BY id DESC LIMIT :limit", fields, TableBuilderBlockSubmission, where))
+	nstmt, err := s.DB.PrepareNamed(fmt.Sprintf("SELECT %s FROM %s %s ORDER BY slot DESC, inserted_at DESC %s", fields, TableBuilderBlockSubmission, where, limit))
 	if err != nil {
 		return nil, err
 	}

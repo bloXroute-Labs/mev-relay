@@ -25,7 +25,7 @@ func TestDecodeJSON(t *testing.T) {
 		B int `json:"b"`
 	}
 	payload := bytes.NewReader([]byte(`{"a":1,"b":2,"c":3}`))
-	err := DecodeJSON(payload, &x)
+	err := decodeJSON(payload, &x)
 	require.Error(t, err)
 	require.Equal(t, "json: unknown field \"c\"", err.Error())
 }

@@ -23,13 +23,6 @@ type PerformanceStats struct {
 	endpointsStats    map[string]*EndpointStats
 }
 
-// PerformanceStatsRecord has the bloxroute stats record
-type PerformanceStatsRecord struct {
-	StartTime      string                    `json:"start_timestamp"`
-	EndTime        string                    `json:"end_timestamp"`
-	EndpointsStats map[string]*EndpointStats `json:"endpoints_stats"`
-}
-
 // NewPerformanceStats creates the PerformanceStats
 func NewPerformanceStats() PerformanceStats {
 	return PerformanceStats{
@@ -37,6 +30,13 @@ func NewPerformanceStats() PerformanceStats {
 		intervalStartTime: time.Now(),
 		endpointsStats:    make(map[string]*EndpointStats),
 	}
+}
+
+// PerformanceStatsRecord has the bloxroute stats record
+type PerformanceStatsRecord struct {
+	StartTime      string                    `json:"start_timestamp"`
+	EndTime        string                    `json:"end_timestamp"`
+	EndpointsStats map[string]*EndpointStats `json:"endpoints_stats"`
 }
 
 // CloseInterval closes an interval and return the bloxroute stats record

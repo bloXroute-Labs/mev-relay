@@ -3,12 +3,16 @@ package server
 import (
 	"context"
 	"encoding/json"
-
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/bloXroute-Labs/gateway/v2/services/statistics"
+	bxtypes "github.com/bloXroute-Labs/gateway/v2/types"
+	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
 	"github.com/cornelk/hashmap"
+	"github.com/fluent/fluent-logger-golang/fluent"
 	"github.com/gorilla/mux"
 )
 
@@ -36,7 +40,7 @@ type relayRanking struct {
 
 // StartActivityLogger starts a loop that outputs
 // validator request logs every 30 minutes and relay general performance every 1 minute
-func (m *RelayService) StartActivityLogger(parent context.Context) {
+func (m *BoostService) StartActivityLogger(parent context.Context) {
 	ticker1Minute := time.NewTicker(relayPerformanceInterval)
 	ticker30Minutes := time.NewTicker(activityPerformanceInterval)
 	for {
@@ -52,34 +56,42 @@ func (m *RelayService) StartActivityLogger(parent context.Context) {
 	}
 }
 
-func (m *RelayService) logPerformance() {
+func (m *BoostService) logPerformance() {
+	if m.stats.NodeID == "" {
+		return
+	}
+
 	endInterval := time.Now()
 	performanceStatsRecord := m.performanceStats.CloseInterval(endInterval)
 	if performanceStatsRecord.StartTime != "0001-01-01T00:00:00.000000" {
-		record := map[string]interface{}{
-			"data": performanceStatsRecord,
-			"type": "BuilderRelayPerformance",
+		record := statistics.Record{
+			Data: performanceStatsRecord,
+			Type: "BuilderRelayPerformance",
 		}
-		m.log.Info(record, endInterval, "builder-relay.stats.performance")
+		m.stats.LogToFluentD(record, endInterval, statsNamePerformance)
 	}
 }
 
-func (m *RelayService) logValidatorActivity() {
-	m.log.WithField("validator-activity", m.validatorActivity.String()).Info("calls made within the last 30 minutes")
-	m.validatorActivity = hashmap.New[string, validatorActivity]()
+func (m *BoostService) logValidatorActivity() {
+	activity := make([]string, 0)
+	for _, key := range m.validatorActivity.Keys() {
+		activity = append(activity, key)
+	}
+	m.log.WithField("validator-activity", activity).Info("calls made within the last 30 minutes")
+	m.validatorActivity = syncmap.NewStringMapOf[validatorActivity]()
 }
 
-func (m *RelayService) logRelayActivity() {
+func (m *BoostService) logRelayActivity() {
 	if data, err := json.Marshal(m.relayRankings); err != nil {
 		m.log.WithError(err).Warn("could not json marshal relay rankings")
 		m.log.WithField("relay-rankings", m.relayRankings).Info("relay rankings within the last 30 minutes")
 	} else {
 		m.log.WithField("relay-rankings", string(data)).Info("relay rankings within the last 30 minutes")
 	}
-	m.relayRankings = make(map[string]relayRanking)
+	m.relayRankings = syncmap.NewStringMapOf[relayRanking]()
 }
 
-func (m *RelayService) trackActivity(path string, r *http.Request) {
+func (m *BoostService) trackActivity(path string, r *http.Request) {
 
 	if path == "/" || strings.Contains(path, "/static/") {
 		return
@@ -103,14 +115,14 @@ func (m *RelayService) trackActivity(path string, r *http.Request) {
 
 	// not every request has pub keys available, set latest call for id
 	if len(pubkeys) == 0 {
-		activity, ok := m.validatorActivity.Get(id)
+		activity, ok := m.validatorActivity.Load(id)
 		if !ok {
-			m.validatorActivity.Set(id, validatorActivity{
+			m.validatorActivity.Store(id, validatorActivity{
 				LastCall: time.Now(),
 				Activity: hashmap.New[string, requests](),
 			})
 		} else {
-			m.validatorActivity.Set(id, validatorActivity{
+			m.validatorActivity.Store(id, validatorActivity{
 				LastCall: time.Now(),
 				Activity: activity.Activity,
 			})
@@ -119,7 +131,7 @@ func (m *RelayService) trackActivity(path string, r *http.Request) {
 	}
 
 	for _, pubkey := range pubkeys {
-		activity, ok := m.validatorActivity.Get(id)
+		activity, ok := m.validatorActivity.Load(id)
 		if !ok {
 			req := hashmap.New[string, requests]()
 			count := hashmap.New[string, int]()
@@ -127,7 +139,7 @@ func (m *RelayService) trackActivity(path string, r *http.Request) {
 			req.Set(pubkey, requests{
 				Count: count,
 			})
-			m.validatorActivity.Set(id, validatorActivity{
+			m.validatorActivity.Store(id, validatorActivity{
 				LastCall: time.Now(),
 				Activity: req,
 			})
@@ -161,4 +173,28 @@ func getPubKeyFromRequest(path string, r *http.Request) ([]string, error) {
 		return []string{vars["pubkey"]}, nil
 	}
 	return []string{}, nil
+}
+
+// StartStats adds the fluentDStats data
+// to the service
+func (m *BoostService) StartStats(fluentdHost, nodeID string) {
+	fluentlogger, err := fluent.New(fluent.Config{
+		FluentHost:    fluentdHost,
+		FluentPort:    24224,
+		MarshalAsJSON: true,
+		Async:         true,
+	})
+
+	if err != nil {
+		m.log.Panic()
+	}
+
+	n := bxtypes.NodeID(nodeID)
+
+	t := statistics.FluentdStats{
+		NodeID:  n,
+		FluentD: fluentlogger,
+		Lock:    &sync.RWMutex{},
+	}
+	m.stats = t
 }

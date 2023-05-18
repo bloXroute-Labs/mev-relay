@@ -16,24 +16,26 @@ type BlockSubmission struct {
 
 // GetPayloadsFilters structs
 type GetPayloadsFilters struct {
-	Slot        uint64
-	Cursor      uint64
-	Limit       uint64
-	BlockHash   string
-	BlockNumber uint64
+	Slot          uint64
+	Cursor        uint64
+	Limit         uint64
+	BlockHash     string
+	BlockNumber   uint64
+	BuilderPubkey string
 }
 
 // GetBuilderSubmissionsFilters structs
 type GetBuilderSubmissionsFilters struct {
-	Slot        uint64
-	Limit       uint64
-	BlockHash   string
-	BlockNumber uint64
+	Slot          uint64
+	Limit         uint64
+	BlockHash     string
+	BlockNumber   uint64
+	BuilderPubkey string
 	// Cursor      uint64
 }
 
 func (g GetBuilderSubmissionsFilters) IsDefault() bool {
-	return g.Slot == 0 && g.Limit == 100 && g.BlockHash == "" && g.BlockNumber == 0
+	return g.Slot == 0 && g.Limit == 100 && g.BlockHash == "" && g.BlockNumber == 0 && g.BuilderPubkey == ""
 }
 
 // ValidatorRegistrationEntry structs

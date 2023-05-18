@@ -4,6 +4,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/bloXroute-Labs/mev-relay/common"
 	"github.com/flashbots/go-boost-utils/types"
 )
 
@@ -81,7 +83,13 @@ func (c *MockBeaconInstance) CurrentSlot() (uint64, error) {
 	return c.MockSyncStatus.HeadSlot, nil
 }
 
-func (c *MockBeaconInstance) SubscribeToHeadEvents(slotC chan HeadEventData) {}
+func (c *MockBeaconInstance) SubscribeToHeadEvents(slotC chan HeadEventData) {
+
+}
+
+func (c *MockBeaconInstance) SubscribeToPayloadAttributes(payloadAttributesChan chan PayloadAttributesData) {
+
+}
 
 func (c *MockBeaconInstance) GetProposerDuties(epoch uint64) (*ProposerDutiesResponse, error) {
 	c.addDelay()
@@ -98,6 +106,13 @@ func (c *MockBeaconInstance) addDelay() {
 	}
 }
 
-func (c *MockBeaconInstance) PublishBlock(block *types.SignedBeaconBlock) (code int, err error) {
+func (c *MockBeaconInstance) GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error) {
+	return nil, nil
+}
+
+func (c *MockBeaconInstance) PublishBlock(block *capella.SignedBeaconBlock) (code int, err error) {
 	return 0, nil
+}
+func (c *MockBeaconInstance) GetSlotBlock(slot uint64) (res *common.BeaconBlockMessage, err error) {
+	return nil, nil
 }

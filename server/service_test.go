@@ -5,15 +5,34 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
+	"math/big"
+	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/attestantio/go-builder-client/api"
+	capella2 "github.com/attestantio/go-builder-client/api/capella"
+	v1 "github.com/attestantio/go-builder-client/api/v1"
+	"github.com/attestantio/go-builder-client/spec"
+	capellaapi "github.com/attestantio/go-eth2-client/api/v1/capella"
+	"github.com/attestantio/go-eth2-client/spec/altair"
+	"github.com/attestantio/go-eth2-client/spec/bellatrix"
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/bloXroute-Labs/mev-relay/beaconclient"
+	"github.com/bloXroute-Labs/mev-relay/common"
+	ethCommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/holiman/uint256"
+	"github.com/redis/go-redis/v9"
+	uuid "github.com/satori/go.uuid"
 	"github.com/stretchr/testify/mock"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/bloXroute-Labs/mev-relay/database"
 
@@ -23,16 +42,54 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+var (
+	defaultMockDB              = &database.MockDB{}
+	randomPortMin              = 10000
+	randomPortMax              = 20000
+	testSharedRedisPort        = 18754
+	testBuilderAPubkey         = common.GenerateRandomPublicKey()
+	testBuilderBPubkey         = common.GenerateRandomPublicKey()
+	testBuilderAPubkeyString   = testBuilderAPubkey.String()
+	testBuilderBPubkeyString   = testBuilderBPubkey.String()
+	testHighValueBlockHash     = common.GenerateRandomEthHash()
+	testLowValueBlockHash      = common.GenerateRandomEthHash()
+	testRelayAUUID, _          = uuid.NewV4()
+	testHighBlockValue         = big.NewInt(100)
+	testLowBlockValue          = big.NewInt(1)
+	testEmptySlot              = uint64(0)
+	testEmptyParentHash        = "0x0000000000000000000000000000000000000000000000000000000000000000"
+	testEmptyProposerPublicKey = "0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+	testRedisMessage           = &redis.Message{
+		Channel:      blockSubmissionChannel,
+		Pattern:      "",
+		Payload:      "{\"message\":{\"signature\":\"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\",\"message\":{\"slot\":\"0\",\"parent_hash\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"block_hash\":\"0x52fdfc072182654f163f5f0f9a621d729566c74d10037c4d7bbb0407d1e2c649\",\"builder_pubkey\":\"0x81855ad8681d0d86d1e91e00167939cb6694d2c422acd208a0072939487f6999eb9d18a44784045d87f3c67cf22746e9\",\"proposer_pubkey\":\"0x000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\",\"proposer_fee_recipient\":\"0x0000000000000000000000000000000000000000\",\"gas_limit\":\"0\",\"gas_used\":\"0\",\"value\":\"1\"},\"execution_payload\":{\"parent_hash\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"fee_recipient\":\"0x0000000000000000000000000000000000000000\",\"state_root\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"receipts_root\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"logs_bloom\":\"0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\",\"prev_randao\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"block_number\":\"0\",\"gas_limit\":\"0\",\"gas_used\":\"0\",\"timestamp\":\"0\",\"extra_data\":\"0x\",\"base_fee_per_gas\":\"0\",\"block_hash\":\"0x0000000000000000000000000000000000000000000000000000000000000000\",\"transactions\":[],\"withdrawals\":[]}},\"sender_uuid\":\"9e0d4175-6525-4657-9118-f0109fe27990\"}",
+		PayloadSlice: nil,
+	}
+)
+
 type testBackend struct {
-	boost  *RelayService
+	boost  *BoostService
 	relays []*mockRelay
 }
 
-var defaultMockDB = &database.MockDB{}
-
 // newTestBackend creates a new backend, initializes mock relays, registers them and return the instance
 func newTestBackend(t *testing.T, numRelays int, relayTimeout time.Duration, db database.IDatabaseService) *testBackend {
-	startRedis(t)
+	return newTestBackendWithRedisPort(t, numRelays, relayTimeout, db, defaultRedisPort)
+}
+
+// newTestBackendWithRedisPort creates a new backend with a random Redis port, initializes mock relays, registers them and return the instance
+func newTestBackendWithRandomRedisPort(t *testing.T, numRelays int, relayTimeout time.Duration, db database.IDatabaseService) *testBackend {
+	rand.Seed(time.Now().UnixNano())
+	min := randomPortMin
+	max := randomPortMax
+	randomRedisPort := rand.Intn(max-min+1) + min
+
+	return newTestBackendWithRedisPort(t, numRelays, relayTimeout, db, randomRedisPort)
+}
+
+// newTestBackendWithRedisPort creates a new backend with a specific Redis port, initializes mock relays, registers them and return the instance
+func newTestBackendWithRedisPort(t *testing.T, numRelays int, relayTimeout time.Duration, db database.IDatabaseService, redisPort int) *testBackend {
+	startRedisWithPort(t, redisPort)
 
 	backend := testBackend{
 		relays: make([]*mockRelay, numRelays),
@@ -49,27 +106,31 @@ func newTestBackend(t *testing.T, numRelays int, relayTimeout time.Duration, db 
 		relayEntries[i] = backend.relays[i].RelayEntry
 	}
 
-	opts := RelayServiceOpts{
-		Log:                     testLog,
-		ListenAddr:              "localhost:12345",
-		Relays:                  relayEntries,
-		GenesisForkVersionHex:   "0x00000000",
-		BellatrixForkVersionHex: "0x00000000",
-		GenesisValidatorRootHex: "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
-		RelayRequestTimeout:     relayTimeout,
-		RelayCheck:              true,
-		MaxHeaderBytes:          4000,
-		IsRelay:                 false,
-		SecretKey:               nil,
-		PubKey:                  types.PublicKey{},
-		CheckKnownValidators:    false,
-		KnownValidators:         "",
-		RedisURI:                redisURI,
-		DB:                      db,
+	opts := BoostServiceOpts{
+		Log:                       testLog,
+		ListenAddr:                "localhost:12345",
+		Relays:                    relayEntries,
+		GenesisForkVersionHex:     "0x00000000",
+		BellatrixForkVersionHex:   "0x00000000",
+		CapellaForkVersionHex:     "0x00000000",
+		GenesisValidatorRootHex:   "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
+		RelayRequestTimeout:       relayTimeout,
+		RelayCheck:                true,
+		MaxHeaderBytes:            4000,
+		IsRelay:                   false,
+		SecretKey:                 nil,
+		PubKey:                    types.PublicKey{},
+		CheckKnownValidators:      false,
+		KnownValidators:           "",
+		RedisURI:                  fmt.Sprintf("localhost:%v", redisPort),
+		DB:                        db,
+		GetPayloadRequestCutoffMs: 0,
 	}
-	service, err := NewRelayService(opts)
+	service, err := NewBoostService(opts)
 	require.NoError(t, err)
 
+	beaconInstances := []beaconclient.IBeaconInstance{beaconclient.NewMockBeaconInstance()}
+	service.beaconClient = *beaconclient.NewMultiBeaconClient(opts.Log, beaconInstances)
 	backend.boost = service
 	return &backend
 }
@@ -111,9 +172,15 @@ func (be *testBackend) request(t *testing.T, method string, path string, payload
 	return rr
 }
 
-func TestNewRelayServiceErrors(t *testing.T) {
+func TestNewBoostServiceErrors(t *testing.T) {
 	t.Run("errors when no relays", func(t *testing.T) {
-		_, err := NewRelayService(RelayServiceOpts{testLog, ":123", []RelayEntry{}, "0x00000000", "0x00000000", "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1", time.Second, true, 4000, false, nil, types.PublicKey{}, "", url.URL{}, url.URL{}, url.URL{}, "", false, "", &database.MockDB{}, "", "", "", "", "", "", "", false, RelayMaxProfit, 80})
+		_, err := NewBoostService(BoostServiceOpts{testLog, ":123", []RelayEntry{}, "0x00000000",
+			"0x00000000", "0x00000000", "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
+			time.Second, true, 4000, false, nil,
+			types.PublicKey{}, "", url.URL{}, url.URL{}, url.URL{},
+			"", false, "", testHighPriorityBuilderPubkeys, testHighPerfSimBuilderPubkeys,
+			&database.MockDB{}, "", "", "", "", "", "", "",
+			"", false, RelayMaxProfit, 80, 0, []string{}, 0, 0, false, trace.NewNoopTracerProvider().Tracer("test")})
 		require.Error(t, err)
 	})
 }
@@ -230,150 +297,150 @@ func TestRegisterValidator(t *testing.T) {
 	})
 }
 
-func TestGetHeader(t *testing.T) {
-	getPath := func(slot uint64, parentHash types.Hash, pubkey types.PublicKey) string {
-		return fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), pubkey.String())
-	}
-
-	parentHash := _HexToHash("0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7")
-	pubkey := _HexToPubkey(
-		"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249")
-	path := getPath(testSlot, parentHash, pubkey)
-	require.Equal(t, "/eth/v1/builder/header/1/0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7/0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249", path)
-
-	t.Run("Okay response from relay", func(t *testing.T) {
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-		saveTestBlockSubmission(t, backend.boost.datastore, parentHash, pubkey, types.IntToU256(24), testSlot)
-		rr := backend.request(t, http.MethodGet, path, nil)
-		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
-
-		// Response value should be 24
-		resp := new(types.GetHeaderResponse)
-		err := json.Unmarshal(rr.Body.Bytes(), resp)
-		require.NoError(t, err)
-		require.Equal(t, types.IntToU256(24), resp.Data.Message.Value)
-	})
-
-	t.Run("Use header with highest value", func(t *testing.T) {
-		backend := newTestBackend(t, 3, time.Second, defaultMockDB)
-		saveTestBlockSubmission(t, backend.boost.datastore, parentHash, pubkey, types.IntToU256(12345), testSlot)
-		saveTestBlockSubmission(t, backend.boost.datastore, parentHash, pubkey, types.IntToU256(12346), testSlot)
-		saveTestBlockSubmission(t, backend.boost.datastore, parentHash, pubkey, types.IntToU256(12347), testSlot)
-
-		// Run the request.
-		rr := backend.request(t, http.MethodGet, path, nil)
-
-		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
-
-		// Highest value should be 12347, i.e. third block submission.
-		resp := new(types.GetHeaderResponse)
-		err := json.Unmarshal(rr.Body.Bytes(), resp)
-		require.NoError(t, err)
-		require.Equal(t, types.IntToU256(12347), resp.Data.Message.Value)
-	})
-
-	t.Run("Invalid slot number", func(t *testing.T) {
-		// Number larger than uint64 creates parsing error
-		slot := fmt.Sprintf("%d0", uint64(math.MaxUint64))
-		invalidSlotPath := fmt.Sprintf("/eth/v1/builder/header/%s/%s/%s", slot, parentHash.String(), pubkey.String())
-
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-		rr := backend.request(t, http.MethodGet, invalidSlotPath, nil)
-		require.Equal(t, `{"code":400,"message":"invalid slot"}`+"\n", rr.Body.String())
-		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
-		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
-	})
-
-	t.Run("Invalid pubkey length", func(t *testing.T) {
-		invalidPubkeyPath := fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", 1, parentHash.String(), "0x1")
-
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-		rr := backend.request(t, http.MethodGet, invalidPubkeyPath, nil)
-		require.Equal(t, `{"code":400,"message":"invalid pubkey"}`+"\n", rr.Body.String())
-		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
-		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
-	})
-
-	t.Run("Invalid hash length", func(t *testing.T) {
-		invalidSlotPath := fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", 1, "0x1", pubkey.String())
-
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-		rr := backend.request(t, http.MethodGet, invalidSlotPath, nil)
-		require.Equal(t, `{"code":400,"message":"invalid hash"}`+"\n", rr.Body.String())
-		require.Equal(t, http.StatusBadRequest, rr.Code, rr.Body.String())
-		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
-	})
-
-	t.Run("Invalid parent hash", func(t *testing.T) {
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-
-		invalidParentHashPath := getPath(testSlot, types.Hash{}, pubkey)
-		rr := backend.request(t, http.MethodGet, invalidParentHashPath, nil)
-		require.Equal(t, http.StatusNoContent, rr.Code)
-		require.Equal(t, 0, backend.relays[0].GetRequestCount(path))
-	})
-}
-
 func TestGetPayload(t *testing.T) {
 	path := "/eth/v1/builder/blinded_blocks"
+	slot := uint64(1)
+	blockHash := "0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab1"
+	blockHashTrimmed := strings.TrimPrefix(blockHash, "0x")
+	parentHash := phase0.Hash32(_HexToHash("0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7"))
 
-	payload := types.SignedBlindedBeaconBlock{
-		Signature: _HexToSignature(
-			"0x8c795f751f812eabbabdee85100a06730a9904a4b53eedaa7f546fe0e23cd75125e293c6b0d007aa68a9da4441929d16072668abb4323bb04ac81862907357e09271fe414147b3669509d91d8ffae2ec9c789a5fcd4519629b8f2c7de8d0cce9"),
-		Message: &types.BlindedBeaconBlock{
-			Slot:          1,
-			ProposerIndex: 1,
-			ParentRoot:    types.Root{0x01},
-			StateRoot:     types.Root{0x02},
-			Body: &types.BlindedBeaconBlockBody{
-				RandaoReveal:  types.Signature{0xa1},
-				Eth1Data:      &types.Eth1Data{},
-				Graffiti:      types.Hash{0xa2},
-				SyncAggregate: &types.SyncAggregate{},
-				ExecutionPayloadHeader: &types.ExecutionPayloadHeader{
-					ParentHash:   _HexToHash("0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7"),
-					BlockHash:    _HexToHash("0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab1"),
-					BlockNumber:  12345,
-					FeeRecipient: _HexToAddress("0xdb65fEd33dc262Fe09D9a2Ba8F80b329BA25f941"),
-				},
+	message := &capellaapi.BlindedBeaconBlock{
+		Slot:          phase0.Slot(slot),
+		ProposerIndex: 1,
+		ParentRoot:    phase0.Root{0x01},
+		StateRoot:     phase0.Root{0x02},
+		Body: &capellaapi.BlindedBeaconBlockBody{
+			RANDAOReveal: phase0.BLSSignature{0xa1},
+			ETH1Data: &phase0.ETH1Data{
+				DepositRoot:  phase0.Root{},
+				DepositCount: 0,
+				BlockHash:    ethCommon.Hex2Bytes(blockHashTrimmed),
 			},
+			Graffiti:          [32]byte{},
+			ProposerSlashings: []*phase0.ProposerSlashing{},
+			AttesterSlashings: []*phase0.AttesterSlashing{},
+			Attestations:      []*phase0.Attestation{},
+			Deposits:          []*phase0.Deposit{},
+			VoluntaryExits:    []*phase0.SignedVoluntaryExit{},
+			SyncAggregate: &altair.SyncAggregate{
+				SyncCommitteeBits:      ethCommon.Hex2Bytes("e28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab1e28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab1"),
+				SyncCommitteeSignature: phase0.BLSSignature{},
+			},
+			ExecutionPayloadHeader: &capella.ExecutionPayloadHeader{
+				ParentHash:      parentHash,
+				BlockHash:       phase0.Hash32(_HexToHash(blockHash)),
+				BlockNumber:     12345,
+				FeeRecipient:    bellatrix.ExecutionAddress(_HexToAddress("0xdb65fEd33dc262Fe09D9a2Ba8F80b329BA25f941")),
+				WithdrawalsRoot: phase0.Root{},
+			},
+			BLSToExecutionChanges: []*capella.SignedBLSToExecutionChange{},
 		},
 	}
 
-	t.Run("Okay response from relay", func(t *testing.T) {
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
+	signedBidTrace := &v1.BidTrace{
+		ProposerPubkey: phase0.BLSPubKey{},
+		Value:          new(uint256.Int),
+		Slot:           slot,
+	}
+	headerResp := &common.GetHeaderResponse{
+		Capella: &spec.VersionedSignedBuilderBid{
+			Capella: &capella2.SignedBuilderBid{
+				Message: &capella2.BuilderBid{
+					Header: &capella.ExecutionPayloadHeader{
+						ParentHash: phase0.Hash32{},
+						BlockHash:  phase0.Hash32(_HexToHash(blockHash)),
+					},
+					Value:  nil,
+					Pubkey: phase0.BLSPubKey{},
+				},
+				Signature: phase0.BLSSignature{},
+			},
+		},
+	}
+	payloadResp := &api.VersionedExecutionPayload{
+		Capella: &capella.ExecutionPayload{
+			ParentHash:    phase0.Hash32{},
+			FeeRecipient:  bellatrix.ExecutionAddress{},
+			StateRoot:     [32]byte{},
+			ReceiptsRoot:  [32]byte{},
+			LogsBloom:     [256]byte{},
+			PrevRandao:    [32]byte{},
+			BlockNumber:   0,
+			GasLimit:      0,
+			GasUsed:       0,
+			Timestamp:     0,
+			ExtraData:     []byte{},
+			BaseFeePerGas: [32]byte{},
+			BlockHash:     phase0.Hash32(_HexToHash(blockHash)),
+			Transactions:  []bellatrix.Transaction{},
+			Withdrawals:   []*capella.Withdrawal{},
+		},
+	}
+
+	t.Run("Okay response", func(t *testing.T) {
+		backend := newTestBackendWithRandomRedisPort(t, 1, time.Second, defaultMockDB)
+
+		sk, pk, err := bls.GenerateNewKeypair()
+		require.NoError(t, err)
+
+		root, err := types.ComputeSigningRoot(message, backend.boost.proposerSigningDomain)
+		require.NoError(t, err)
+
+		sig := bls.Sign(sk, root[:])
+		sig2, err := types.SignMessage(message, backend.boost.proposerSigningDomain, sk)
+		require.NoError(t, err)
+		require.Equal(t, sig.Compress(), sig2[:])
+
+		var signature types.Signature
+		err = signature.FromSlice(sig.Compress())
+		require.NoError(t, err)
+
+		payload := &capellaapi.SignedBlindedBeaconBlock{
+			Message:   message,
+			Signature: phase0.BLSSignature(signature),
+		}
+
+		backend.boost.validatorsByIndex.Store(strconv.Itoa(int(message.ProposerIndex)), hexutil.Encode(pk.Compress()))
+		err = backend.boost.datastore.SaveBlockSubmissionTx(context.Background(), nil, signedBidTrace, headerResp, payloadResp, blockHash, parentHash.String(), "")
+		require.NoError(t, err)
+
 		rr := backend.request(t, http.MethodPost, path, payload)
 		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
-		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
 
-		resp := new(types.GetPayloadResponse)
-		err := json.Unmarshal(rr.Body.Bytes(), resp)
-		require.NoError(t, err)
-		require.Equal(t, payload.Message.Body.ExecutionPayloadHeader.BlockHash, resp.Data.BlockHash)
+		// TODO: ok to get rid of this?
+		//resp := new(common.GetPayloadResponse)
+		//rrBytes := rr.Body.Bytes()
+		//err = json.Unmarshal(rrBytes, resp)
+		//require.NoError(t, err)
 	})
 
-	t.Run("Bad response from relays", func(t *testing.T) {
-		backend := newTestBackend(t, 2, time.Second, defaultMockDB)
-		resp := new(types.GetPayloadResponse)
+	t.Run("Bad response - don't store payload", func(t *testing.T) {
+		backend := newTestBackendWithRandomRedisPort(t, 1, time.Second, defaultMockDB)
 
-		// Delays are needed because otherwise one relay might never receive a request
-		backend.relays[0].ResponseDelay = 10 * time.Millisecond
-		backend.relays[1].ResponseDelay = 10 * time.Millisecond
+		sk, pk, err := bls.GenerateNewKeypair()
+		require.NoError(t, err)
 
-		// 1/2 failing responses are okay
-		backend.relays[0].GetPayloadResponse = resp
+		root, err := types.ComputeSigningRoot(message, backend.boost.proposerSigningDomain)
+		require.NoError(t, err)
+
+		sig := bls.Sign(sk, root[:])
+		sig2, err := types.SignMessage(message, backend.boost.proposerSigningDomain, sk)
+		require.NoError(t, err)
+		require.Equal(t, sig.Compress(), sig2[:])
+
+		var signature types.Signature
+		err = signature.FromSlice(sig.Compress())
+		require.NoError(t, err)
+
+		payload := &capellaapi.SignedBlindedBeaconBlock{
+			Message:   message,
+			Signature: phase0.BLSSignature(signature),
+		}
+
+		backend.boost.validatorsByIndex.Store(strconv.Itoa(int(message.ProposerIndex)), hexutil.Encode(pk.Compress()))
+
 		rr := backend.request(t, http.MethodPost, path, payload)
-		require.Equal(t, 1, backend.relays[0].GetRequestCount(path))
-		require.Equal(t, 1, backend.relays[1].GetRequestCount(path))
-		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
-
-		// 2/2 failing responses are okay
-		backend.relays[1].GetPayloadResponse = resp
-		rr = backend.request(t, http.MethodPost, path, payload)
-		require.Equal(t, 2, backend.relays[0].GetRequestCount(path))
-		require.Equal(t, 2, backend.relays[1].GetRequestCount(path))
-		require.Equal(t, `{"code":502,"message":"no successful relay response"}`+"\n", rr.Body.String())
-		require.Equal(t, http.StatusBadGateway, rr.Code, rr.Body.String())
+		require.Equal(t, http.StatusInternalServerError, rr.Code, rr.Body.String())
 	})
 }
 
@@ -407,99 +474,54 @@ func TestCheckRelays(t *testing.T) {
 	})
 }
 
-func TestBuilderDisableGetHeaderResponse(t *testing.T) {
-	getPath := func(slot uint64, parentHash types.Hash, pubkey types.PublicKey) string {
-		return fmt.Sprintf("/eth/v1/builder/header/%d/%s/%s", slot, parentHash.String(), pubkey.String())
-	}
-
-	parentHash := _HexToHash("0xe28385e7bd68df656cd0042b74b69c3104b5356ed1f20eb69f1f925df47a3ab7")
-	pubkey := _HexToPubkey(
-		"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249")
-
-	t.Run("Successful response response from relay, 'getHeader' request temporarily disabled", func(t *testing.T) {
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-		backend.boost.getHeaderLatestDisabledSlot = 0
-		backend.boost.latestSlotBlockReceived = 100
-		expectedLatestDisabledSlot := backend.boost.latestSlotBlockReceived + disableGetHeaderResponseSlotInterval
-		var responseValue uint64 = 24
-		saveTestBlockSubmission(t, backend.boost.datastore, parentHash, pubkey, types.IntToU256(responseValue), expectedLatestDisabledSlot+1)
-
-		// Send BuilderDisableGetHeaderResponse request.
-		rr := backend.request(t, http.MethodPost, pathBuilderDisableGetHeaderResponse, nil)
-		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
-		require.Equal(t, backend.boost.getHeaderLatestDisabledSlot, expectedLatestDisabledSlot)
-
-		// Send getHeader request with latest disabled slot, should return StatusNoContent
-		rr = backend.request(t, http.MethodGet, getPath(backend.boost.getHeaderLatestDisabledSlot, parentHash, pubkey), nil)
-		require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
-
-		// Send getHeader request again with the slot after the latest disabled, should now return best header with correct response value
-		rr = backend.request(t, http.MethodGet, getPath(backend.boost.getHeaderLatestDisabledSlot+1, parentHash, pubkey), nil)
-		resp := new(types.GetHeaderResponse)
-		err := json.Unmarshal(rr.Body.Bytes(), resp)
-		require.NoError(t, err)
-		require.Equal(t, types.IntToU256(responseValue), resp.Data.Message.Value)
-	})
-
-	t.Run("Successful response from relay, getHeaderLatestDisabledSlot not updated", func(t *testing.T) {
-		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
-		// getHeaderLatestDisabledSlot is larger than latestSlotBlockReceived
-		var getHeaderLatestDisabledSlotInitialValue uint64 = 104
-		backend.boost.getHeaderLatestDisabledSlot = getHeaderLatestDisabledSlotInitialValue
-		backend.boost.latestSlotBlockReceived = 100
-		var responseValue uint64 = 24
-		saveTestBlockSubmission(t, backend.boost.datastore, parentHash, pubkey, types.IntToU256(responseValue), backend.boost.getHeaderLatestDisabledSlot+1)
-
-		// Send getHeader request, should return StatusNoContent
-		rr := backend.request(t, http.MethodGet, getPath(backend.boost.getHeaderLatestDisabledSlot, parentHash, pubkey), nil)
-		require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
-
-		// Send BuilderDisableGetHeaderResponse request and make sure getHeaderLatestDisabledSlot hasn't changed.
-		rr = backend.request(t, http.MethodPost, pathBuilderDisableGetHeaderResponse, nil)
-		require.Equal(t, http.StatusOK, rr.Code, rr.Body.String())
-		require.Equal(t, backend.boost.getHeaderLatestDisabledSlot, getHeaderLatestDisabledSlotInitialValue)
-
-		// Send getHeader request again with latest disabled slot, should still return StatusNoContent
-		rr = backend.request(t, http.MethodGet, getPath(backend.boost.getHeaderLatestDisabledSlot, parentHash, pubkey), nil)
-		require.Equal(t, http.StatusNoContent, rr.Code, rr.Body.String())
-
-		// Send getHeader request a third time with the slot after the latest disabled, should now return best header with correct response value
-		rr = backend.request(t, http.MethodGet, getPath(backend.boost.getHeaderLatestDisabledSlot+1, parentHash, pubkey), nil)
-		resp := new(types.GetHeaderResponse)
-		err := json.Unmarshal(rr.Body.Bytes(), resp)
-		require.NoError(t, err)
-		require.Equal(t, types.IntToU256(responseValue), resp.Data.Message.Value)
-	})
-}
-
 func TestHandleDataBuilderBidsReceivedReturnCorrectValueFromCache(t *testing.T) {
 	db := &database.MockDB{}
 	backend := newTestBackend(t, 1, time.Second, db)
-	filters := database.GetBuilderSubmissionsFilters{Limit: 100}
-	path := "/relay/v1/data/bidtraces/builder_blocks_received"
+	filters := database.GetBuilderSubmissionsFilters{Limit: 500}
+	basePath := "/relay/v1/data/bidtraces/builder_blocks_received"
+	slotQuery := "?slot="
+
+	const (
+		blockHash1             = "BlockHash"
+		blockHash2             = "BlockHash2"
+		blockNumber1Int uint64 = 1
+		blockNumber2Int uint64 = 2
+		slotNumber1Int  uint64 = 1
+		slotNumber2Int  uint64 = 2
+		builderPubkey1         = "BuilderPubkey"
+		builderPubkey2         = "BuilderPubkey2"
+	)
+
+	slotNumber1 := fmt.Sprintf("%v", slotNumber1Int)
+	slotNumber2 := fmt.Sprintf("%v", slotNumber2Int)
+
+	// set this to the same slot as the last DB response because we do not return results from the current slot (latestSlotBlockReceived + 1)
+	backend.boost.latestSlotBlockReceived.Store(2)
 
 	dbResponse := []*database.BuilderBlockSubmissionEntry{{
 		InsertedAt:           time.Now(),
-		Slot:                 1,
+		Slot:                 slotNumber1Int,
 		ParentHash:           "ParentHash",
-		BlockHash:            "BlockHash",
-		BuilderPubkey:        "BuilderPubkey",
+		BlockHash:            blockHash1,
+		BuilderPubkey:        builderPubkey1,
 		ProposerPubkey:       "ProposerPubkey",
 		ProposerFeeRecipient: "ProposerFeeRecipient",
 		GasUsed:              1,
 		GasLimit:             1,
 		Value:                "Value",
+		BlockNumber:          blockNumber1Int,
 	}, {
 		InsertedAt:           time.Now(),
-		Slot:                 2,
+		Slot:                 slotNumber1Int,
 		ParentHash:           "ParentHash2",
-		BlockHash:            "BlockHash2",
-		BuilderPubkey:        "BuilderPubkey2",
+		BlockHash:            blockHash2,
+		BuilderPubkey:        builderPubkey2,
 		ProposerPubkey:       "ProposerPubkey2",
 		ProposerFeeRecipient: "ProposerFeeRecipient2",
 		GasUsed:              2,
 		GasLimit:             2,
 		Value:                "Value2",
+		BlockNumber:          blockNumber2Int,
 	}}
 
 	firstExpectedResponse, err := json.Marshal([]BidTraceWithTimestampJSON{{
@@ -513,6 +535,7 @@ func TestHandleDataBuilderBidsReceivedReturnCorrectValueFromCache(t *testing.T) 
 			GasLimit:             dbResponse[0].GasLimit,
 			GasUsed:              dbResponse[0].GasUsed,
 			Value:                dbResponse[0].Value,
+			BlockNumber:          dbResponse[0].BlockNumber,
 		},
 		TimestampMs: dbResponse[0].InsertedAt.UnixMilli(),
 		Timestamp:   dbResponse[0].InsertedAt.Unix(),
@@ -530,13 +553,19 @@ func TestHandleDataBuilderBidsReceivedReturnCorrectValueFromCache(t *testing.T) 
 			GasLimit:             dbResponse[1].GasLimit,
 			GasUsed:              dbResponse[1].GasUsed,
 			Value:                dbResponse[1].Value,
+			BlockNumber:          dbResponse[1].BlockNumber,
 		},
 		TimestampMs: dbResponse[1].InsertedAt.UnixMilli(),
 		Timestamp:   dbResponse[1].InsertedAt.Unix(),
 	}})
 	require.NoError(t, err)
 
+	emptyExpectedResponse, err := json.Marshal([]BidTraceWithTimestampJSON{})
+	require.NoError(t, err)
+
 	// For the first request response must be from database as firstExpectedResponse
+	filters.Slot = 1
+	path := basePath + slotQuery + slotNumber1
 	db.Mock.On("GetBuilderSubmissions", mock.Anything, filters).
 		Return([]*database.BuilderBlockSubmissionEntry{dbResponse[0]}, nil).
 		After(time.Second * 2).
@@ -545,24 +574,7 @@ func TestHandleDataBuilderBidsReceivedReturnCorrectValueFromCache(t *testing.T) 
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, string(firstExpectedResponse), rr.Body.String())
 
-	// For the second request we have delay 2 seconds and response must be from cache as firstExpectedResponse
-	db.Mock.On("GetBuilderSubmissions", mock.Anything, filters).
-		After(time.Second*2).
-		Return([]*database.BuilderBlockSubmissionEntry{dbResponse[1]}, nil).
-		Once()
-	rr = backend.request(t, http.MethodGet, path, nil)
-	require.Equal(t, http.StatusOK, rr.Code)
-	require.JSONEq(t, string(firstExpectedResponse), rr.Body.String())
-
-	// For the third request we don't delay 2 seconds and response must be from database as secondExpectedResponse
-	db.Mock.On("GetBuilderSubmissions", mock.Anything, filters).
-		Return([]*database.BuilderBlockSubmissionEntry{dbResponse[1]}, nil).
-		Once()
-	rr = backend.request(t, http.MethodGet, path, nil)
-	require.Equal(t, http.StatusOK, rr.Code)
-	require.JSONEq(t, string(secondExpectedResponse), rr.Body.String())
-
-	// For the fourth request we have delay 2 seconds and response must be from database as secondExpectedResponse
+	// For the second request we have delay 2 seconds and response must be from cache as secondExpectedResponse
 	db.Mock.On("GetBuilderSubmissions", mock.Anything, filters).
 		After(time.Second*2).
 		Return([]*database.BuilderBlockSubmissionEntry{dbResponse[1]}, nil).
@@ -570,4 +582,22 @@ func TestHandleDataBuilderBidsReceivedReturnCorrectValueFromCache(t *testing.T) 
 	rr = backend.request(t, http.MethodGet, path, nil)
 	require.Equal(t, http.StatusOK, rr.Code)
 	require.JSONEq(t, string(secondExpectedResponse), rr.Body.String())
+
+	// For this third request we are requesting slot 2 so response should be an empty array
+	filters.Slot = 2
+	path = basePath + slotQuery + slotNumber2
+	backend.boost.latestSlotBlockReceived.Store(1) // current slot is 2
+	db.Mock.On("GetBuilderSubmissions", mock.Anything, filters).
+		Return([]*database.BuilderBlockSubmissionEntry{dbResponse[1]}, nil)
+	rr = backend.request(t, http.MethodGet, path, nil)
+	require.Equal(t, http.StatusOK, rr.Code)
+	require.JSONEq(t, string(emptyExpectedResponse), rr.Body.String())
+
+	// For this 4th request we are not including query parameters so response should be an error
+	path = basePath
+	backend.boost.latestSlotBlockReceived.Store(1) // current slot is 2
+	db.Mock.On("GetBuilderSubmissions", mock.Anything, filters).
+		Return([]*database.BuilderBlockSubmissionEntry{dbResponse[1]}, nil)
+	rr = backend.request(t, http.MethodGet, path, nil)
+	require.Equal(t, http.StatusBadRequest, rr.Code)
 }

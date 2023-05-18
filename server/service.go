@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/big"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"sort"
@@ -18,30 +20,56 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/patrickmn/go-cache"
-
-	"github.com/ethereum/go-ethereum/log"
-
-	"github.com/bloXroute-Labs/mev-relay/beaconclient"
-	"github.com/bloXroute-Labs/mev-relay/database"
-	"github.com/bloXroute-Labs/mev-relay/datastore"
-	"github.com/cornelk/hashmap"
+	capellaBuilderAPI "github.com/attestantio/go-builder-client/api/capella"
+	v1 "github.com/attestantio/go-builder-client/api/v1"
+	capellaapi "github.com/attestantio/go-eth2-client/api/v1/capella"
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/bloXroute-Labs/gateway/v2/sdnmessage"
+	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
+	"github.com/cenkalti/backoff/v4"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/gorilla/mux"
+	"github.com/justinas/alice"
+	"github.com/patrickmn/go-cache"
+	"github.com/redis/go-redis/v9"
+	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
 	blst "github.com/supranational/blst/bindings/go"
+	"go.opentelemetry.io/contrib/instrumentation/github.com/gorilla/mux/otelmux"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	uberatomic "go.uber.org/atomic"
+
+	"github.com/bloXroute-Labs/gateway/v2/services/statistics"
+	"github.com/bloXroute-Labs/mev-relay/beaconclient"
+	"github.com/bloXroute-Labs/mev-relay/common"
+	"github.com/bloXroute-Labs/mev-relay/database"
+	"github.com/bloXroute-Labs/mev-relay/datastore"
+	"go.opentelemetry.io/otel/codes"
 )
 
 const (
-	databaseRequestTimeout = time.Second * 12
+	defaultDatabaseRequestTimeout = 12 * time.Second
 
 	slotsPerEpoch                        = 32
 	emptyWalletAddressZero               = "0x0000000000000000000000000000000000000000"
 	emptyWalletAddressOne                = "0x0000000000000000000000000000000000000001"
+	coinbaseExchangeWalletAddress        = "0x4675c7e5baafbffbca748158becba61ef3b0a263"
 	disableGetHeaderResponseSlotInterval = 10
-	emptyBeaconHeadEventTimerInterval    = 3 * time.Second
+	bestBlockLoggingTimerInterval        = 11 * time.Second // slot time - 1 sec
+	blockSimulationTimeout               = 3 * time.Second
 	builderBidsReceivedKey               = "builderBidsReceived"
+	clientAllowedGetHeaderReqPerMin      = 5
+	bloxrouteExtraData                   = "0x506f776572656420627920626c6f58726f757465"
+
+	saveDeliveredPayloadMaxElapsedTime      = 20 * time.Second
+	saveDeliveredPayloadMaxInterval         = 5 * time.Second
+	getValidatorRegistrationsMaxElapsedTime = 2 * time.Second
+
+	blockSubmissionChannel = "blockSubmission"
+	redisPubsubChannelSize = 1000
 )
 
 // RPCRequestType represents the JSON-RPC methods that are callable
@@ -69,12 +97,16 @@ var (
 	errInvalidHash               = errors.New("invalid hash")
 	errInvalidPubkey             = errors.New("invalid pubkey")
 	errNoSuccessfulRelayResponse = errors.New("no successful relay response")
+	errServerAlreadyRunning      = errors.New("server already running")
+	errSimulationTimeout         = errors.New("timeout while waiting for successful simulation response")
 
-	errServerAlreadyRunning = errors.New("server already running")
+	nilHash     = types.Hash{}
+	nilResponse = struct{}{}
+
+	defaultBuilderPubkeySkipSimulationThreshold = big.NewInt(500000000000000000) // 0.5 ETH
+
+	defaultBuilderAccountIDSkipSimulationThreshold = new(big.Int).Mul(big.NewInt(20), big.NewInt(1000000000000000000)) // 20 ETH
 )
-
-var nilHash = types.Hash{}
-var nilResponse = struct{}{}
 
 type httpErrorResp struct {
 	Code    int    `json:"code"`
@@ -90,6 +122,8 @@ type blockValuePayloadParams struct {
 	ProposerFeeRecipient string    `json:"proposer_fee_recipient"`
 	GasUsed              uint64    `json:"gas_used"`
 	BuilderPubkey        string    `json:"builder_pubkey"`
+	ParentHash           string    `json:"parent_hash"`
+	TimestampMs          int64     `json:"timestamp_ms"`
 }
 
 type slotProposerPayloadParams struct {
@@ -109,82 +143,97 @@ type slotProposerPayload struct {
 }
 
 type payloadLog struct {
-	BlockNumber uint64 `json:"block_number"`
-	Hash        string `json:"hash"`
-	Slot        uint64 `json:"slot"`
-	Proposer    uint64 `json:"proposer"`
+	BlockNumber      uint64 `json:"block_number"`
+	Hash             string `json:"hash"`
+	Slot             uint64 `json:"slot"`
+	Proposer         uint64 `json:"proposer"`
+	IsBloxrouteBlock bool   `json:"is_bloxroute_block"`
+	ExtraData        string `json:"extra_data"`
 }
 
-type builderBlockReceivedStatsRecord struct {
-	Slot                uint64        `json:"slot"`
-	BlockHash           string        `json:"block_hash"`
-	ParentHash          string        `json:"parent_hash"`
-	BuilderPubkey       string        `json:"builder_pubkey"`
-	ProposerPubkey      string        `json:"proposer_pubkey"`
-	Value               types.U256Str `json:"value"`
-	TxCount             int           `json:"tx_count"`
-	AccountID           string        `json:"account_id"`
-	FromInternalBuilder bool          `json:"from_internal_builder"`
+type bidSavedLog struct {
+	Duration          int64  `json:"duration"`
+	ValidatorIsActive bool   `json:"validator_is_active"`
+	BlockHash         string `json:"block_hash"`
+	BuilderPubKey     string `json:"builder_pub_key"`
+	Slot              uint64 `json:"slot"`
 }
 
-type bestHeaderStatsRecord struct {
-	Data              interface{} `json:"data"`
-	Slot              string      `json:"slot"`
-	ProposerPublicKey string      `json:"proposer_public_key"`
-	Type              string      `json:"type"`
-}
-
-type proposerDutiesResponseData struct {
-	Pubkey         string `json:"pubkey"`
-	ValidatorIndex uint64 `json:"validator_index,string"`
-	Slot           uint64 `json:"slot,string"`
-}
-
-type proposerDutiesResponse struct {
-	Data []proposerDutiesResponseData
-}
-
-// RelayServiceOpts provides all available options for use with NewRelayService
-type RelayServiceOpts struct {
-	Log                     *logrus.Entry
-	ListenAddr              string
-	Relays                  []RelayEntry
-	GenesisForkVersionHex   string
-	BellatrixForkVersionHex string
-	GenesisValidatorRootHex string
-	RelayRequestTimeout     time.Duration
-	RelayCheck              bool
-	MaxHeaderBytes          int
-	IsRelay                 bool
-	SecretKey               *blst.SecretKey
-	PubKey                  types.PublicKey
-	BeaconNode              string
-	ExecutionNode           url.URL
-	BeaconChain             url.URL
-	Etherscan               url.URL
-	KnownValidators         string
-	CheckKnownValidators    bool
-	BuilderIPs              string
-	DB                      database.IDatabaseService
-	RedisURI                string
-	RedisPrefix             string
-	SDNURL                  string
-	CertificatesPath        string
-	SimulationNodes         string
-	CloudServicesEndpoint   string
-	CloudServicesAuthHeader string
-	SendSlotProposerDuties  bool
-	RelayType               RelayType
-	RedisPoolSize           int
+// BoostServiceOpts provides all available options for use with NewBoostService
+type BoostServiceOpts struct {
+	Log                         *logrus.Entry
+	ListenAddr                  string
+	Relays                      []RelayEntry
+	GenesisForkVersionHex       string
+	BellatrixForkVersionHex     string
+	CapellaForkVersionHex       string
+	GenesisValidatorRootHex     string
+	RelayRequestTimeout         time.Duration
+	RelayCheck                  bool
+	MaxHeaderBytes              int
+	IsRelay                     bool
+	SecretKey                   *blst.SecretKey
+	PubKey                      types.PublicKey
+	BeaconNode                  string
+	ExecutionNode               url.URL
+	BeaconChain                 url.URL
+	Etherscan                   url.URL
+	KnownValidators             string
+	CheckKnownValidators        bool
+	BuilderIPs                  string
+	HighPriorityBuilderPubkeys  *syncmap.SyncMap[string, bool]
+	HighPerfSimBuilderPubkeys   *syncmap.SyncMap[string, bool]
+	DB                          database.IDatabaseService
+	RedisURI                    string
+	RedisPrefix                 string
+	SDNURL                      string
+	CertificatesPath            string
+	SimulationNodes             string
+	SimulationNodeHighPerf      string
+	CloudServicesEndpoint       string
+	CloudServicesAuthHeader     string
+	SendSlotProposerDuties      bool
+	RelayType                   RelayType
+	RedisPoolSize               int
+	TopBlockLimit               int
+	ExternalRelaysForComparison []string
+	GetPayloadRequestCutoffMs   int
+	CapellaForkEpoch            int64
+	EnableBidSaveCancellation   bool
+	Tracer                      trace.Tracer
 }
 
 type ProvidedHeaders struct {
-	Headers           []*types.GetHeaderResponse
+	Headers           []*common.GetHeaderResponse
 	ProposerPublicKey string
 }
 
-// RelayService TODO
-type RelayService struct {
+type randaoHelper struct {
+	slot       uint64
+	prevRandao string
+}
+
+type saveBlockData struct {
+	getHeaderResponse common.GetHeaderResponse
+	submission        common.WrappedCapellaBuilderSubmitBlockRequest
+	signedBidTrace    *v1.BidTrace
+	receivedAt        time.Time
+	clientIPAddress   string
+	reqRemoteAddress  string
+	simulationTime    string
+	tier              sdnmessage.AccountTier
+}
+
+type builderContextData struct {
+	Ctx             context.Context
+	Cancel          context.CancelFunc
+	BidReceivedTime time.Time
+	BidValue        *big.Int
+	BlockHash       string
+}
+
+// BoostService TODO
+type BoostService struct {
 	listenAddr                     string
 	relays                         []RelayEntry
 	log                            *logrus.Entry
@@ -192,7 +241,6 @@ type RelayService struct {
 	relayCheck                     bool
 	db                             database.IDatabaseService
 	datastore                      *datastore.Datastore
-	redis                          *datastore.RedisCache
 	bidTraceWithTimestampJSONCache *cache.Cache
 
 	isRelay   bool
@@ -205,48 +253,100 @@ type RelayService struct {
 	beaconChain,
 	etherscan url.URL
 
-	knownValidators         string
-	checkKnownValidators    bool
-	validators              map[string]Validator
-	relayRankings           map[string]relayRanking
-	relayRankingsLock       sync.RWMutex
-	validatorActivity       *hashmap.HashMap[string, validatorActivity]
-	genesisForkVersion      string
-	bellatrixForkVersion    string
-	proposerSigningDomain   types.Domain
-	genesisValidatorRootHex string
-	builderIPs              string
-	certificatesPath        string
-	sdnURL                  string
-	simulationNodes         string
+	knownValidators                                        string
+	checkKnownValidators                                   bool
+	validators                                             *syncmap.SyncMap[string, Validator]
+	validatorsByIndex                                      *syncmap.SyncMap[string, string]
+	validatorsLock                                         sync.RWMutex
+	relayRankings                                          *syncmap.SyncMap[string, relayRanking]
+	validatorActivity                                      *syncmap.SyncMap[string, validatorActivity]
+	genesisForkVersion                                     string
+	bellatrixForkVersion                                   string
+	proposerSigningDomain                                  types.Domain
+	genesisValidatorRootHex                                string
+	recentBlocks                                           []blockStat
+	recentBlocksLock                                       sync.RWMutex
+	stats                                                  statistics.FluentdStats
+	builderIPs                                             string
+	highPriorityBuilderDataLock                            sync.RWMutex
+	highPriorityBuilderPubkeys                             *syncmap.SyncMap[string, bool]
+	highPriorityBuilderAccountIDs                          *syncmap.SyncMap[string, bool]
+	highPriorityBuilderPubkeysToSkipSimulationThreshold    *syncmap.SyncMap[string, *big.Int]
+	highPriorityBuilderAccountIDsToSkipSimulationThreshold *syncmap.SyncMap[string, *big.Int]
+	ultraBuilderAccountIDs                                 *syncmap.SyncMap[string, bool]
+	noRateLimitUltraBuilderAccIDs                          *syncmap.SyncMap[string, bool]
+	highPerfSimBuilderPubkeys                              *syncmap.SyncMap[string, bool]
+	certificatesPath                                       string
+	sdnURL                                                 string
+	simulationNodes                                        []string
+	simulationNodeHighPerf                                 string
 
-	providedHeaders *hashmap.HashMap[int64, ProvidedHeaders]
-	providedPayload *hashmap.HashMap[int64, bool]
+	expectedBlockNumber uint64
+
+	expectedPrevRandao      randaoHelper
+	expectedPayloadDataLock sync.RWMutex
+
+	externalRelaysForComparison []string
+
+	demotedBuilderLock sync.RWMutex
+	demotedBuilders    *syncmap.SyncMap[string, string]
+
+	providedHeaders *syncmap.SyncMap[int64, ProvidedHeaders]
+	providedPayload *syncmap.SyncMap[int64, bool]
 
 	maxHeaderBytes int
 
 	builderSigningDomain    types.Domain
 	httpClient              http.Client
 	cloudServicesHttpClient http.Client
-	rateLimiter             *rateLimiter
+
+	genesisInfo GetGenesisResponse
+
+	topBlockMap *syncmap.SyncMap[uint64, *syncmap.SyncMap[string, int]]
+
+	getPayloadRequestCutoffMs int
 
 	performanceStats PerformanceStats
 
 	proposerDutiesLock           sync.RWMutex
 	proposerDutiesResponse       []types.BuilderGetValidatorsResponseEntry
 	proposerDutiesSlot           uint64
+	proposerDutiesMap            *syncmap.SyncMap[uint64, *types.RegisterValidatorRequestMessage]
 	isUpdatingProposerDuties     *uberatomic.Bool
 	latestFetchedSlotNumber      uint64
 	cloudServicesEndpoint        string
 	cloudServicesAuthHeader      string
 	sendSlotProposerDuties       bool
 	relayType                    RelayType
-	allProposerDuties            map[uint64]beaconclient.ProposerDutiesResponseData
+	allProposerDuties            *syncmap.SyncMap[uint64, beaconclient.ProposerDutiesResponseData]
 	allProposerDutiesLock        sync.Mutex
-	latestSlotBlockReceived      uint64
-	getHeaderLatestDisabledSlot  uint64
-	emptyBeaconHeadEventTimer    *time.Timer
-	emptyBeaconHeadEventReceived bool
+	latestSlotBlockReceived      *uberatomic.Uint64
+	getHeaderLatestDisabledSlot  *uberatomic.Uint64
+	slotStartTimes               *syncmap.SyncMap[uint64, time.Time]
+	getPayloadRequests           *syncmap.SyncMap[uint64, requestInfo]
+	getHeaderRequests            *syncmap.SyncMap[uint64, []getHeaderRequestInfo]
+	bestBlockBidForSlot          *syncmap.SyncMap[uint64, v1.BidTrace]
+	bestBlockLoggingTimer        *time.Timer
+	bestBloxrouteBlockBidForSlot *syncmap.SyncMap[uint64, v1.BidTrace]
+
+	nextSlotWithdrawalsRoot phase0.Root
+	nextSlotWithdrawals     []*capella.Withdrawal
+	nextSlotWithdrawalsLock sync.RWMutex
+
+	// TODO: remove this and flag??
+	capellaForkEpoch int64
+
+	newBlockChannel                 chan *saveBlockData
+	newPayloadAttributesSlotChannel chan uint64
+	redisBlockSubChannel            chan *redis.Message
+	builderContextsForSlot          *syncmap.SyncMap[uint64, *syncmap.SyncMap[string, *builderContextData]]
+	nodeUUID                        uuid.UUID
+	enableBidSaveCancellation       bool
+
+	slotKeysToExpire *syncmap.SyncMap[uint64, *syncmap.SyncMap[string, bool]]
+	keysToExpireChan chan *syncmap.SyncMap[uint64, []string]
+
+	tracer trace.Tracer
 }
 
 type deliveredPayloadsResult struct {
@@ -254,8 +354,8 @@ type deliveredPayloadsResult struct {
 	err error
 }
 
-// NewRelayService created a new RelayService
-func NewRelayService(opts RelayServiceOpts) (*RelayService, error) {
+// NewBoostService created a new BoostService
+func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 	if len(opts.Relays) == 0 {
 		return nil, errors.New("no relays")
 	}
@@ -265,19 +365,13 @@ func NewRelayService(opts RelayServiceOpts) (*RelayService, error) {
 		return nil, err
 	}
 
-	proposerSigningDomain, err := ComputeDomain(types.DomainTypeBeaconProposer, opts.BellatrixForkVersionHex, opts.GenesisValidatorRootHex)
+	proposerSigningDomain, err := ComputeDomain(types.DomainTypeBeaconProposer, opts.CapellaForkVersionHex, opts.GenesisValidatorRootHex)
 	if err != nil {
 		return nil, err
 	}
 
-	// Connect to Redis
-	redisInstance, err := datastore.NewRedisCache(opts.RedisURI, opts.RedisPrefix, opts.RedisPoolSize)
-	if err != nil {
-		opts.Log.WithError(err).Fatalf("Failed to connect to Redis at %s", opts.RedisURI)
-	}
-	opts.Log.Infof("Connected to Redis at %s", opts.RedisURI)
-
-	datastoreInstance, err := datastore.NewDatastore(opts.Log, redisInstance, opts.DB)
+	opts.Log.Info("Setting up datastore...")
+	datastoreInstance, err := datastore.NewDatastore(opts.RedisURI, opts.RedisPrefix, opts.RedisPoolSize, opts.Log)
 	if err != nil {
 		opts.Log.WithError(err).Fatalf("Failed setting up prod datastore")
 	}
@@ -293,14 +387,13 @@ func NewRelayService(opts RelayServiceOpts) (*RelayService, error) {
 		opts.Log.WithError(err).Error("could not process first beacon node")
 	}
 
-	boostService := &RelayService{
+	boostService := &BoostService{
 		listenAddr:              opts.ListenAddr,
 		relays:                  opts.Relays,
 		log:                     opts.Log.WithField("module", "service"),
 		relayCheck:              opts.RelayCheck,
 		db:                      opts.DB,
 		datastore:               datastoreInstance,
-		redis:                   redisInstance,
 		maxHeaderBytes:          opts.MaxHeaderBytes,
 		isRelay:                 opts.IsRelay,
 		secretKey:               opts.SecretKey,
@@ -313,22 +406,51 @@ func NewRelayService(opts RelayServiceOpts) (*RelayService, error) {
 		checkKnownValidators:    opts.CheckKnownValidators,
 		certificatesPath:        opts.CertificatesPath,
 		sdnURL:                  opts.SDNURL,
-		validators:              make(map[string]Validator),
-		validatorActivity:       hashmap.New[string, validatorActivity](),
-		relayRankings:           make(map[string]relayRanking),
+		validators:              syncmap.NewStringMapOf[Validator](),
+		validatorsByIndex:       syncmap.NewStringMapOf[string](),
+		validatorsLock:          sync.RWMutex{},
+		validatorActivity:       syncmap.NewStringMapOf[validatorActivity](),
+		relayRankings:           syncmap.NewStringMapOf[relayRanking](),
 		genesisForkVersion:      opts.GenesisForkVersionHex,
 		bellatrixForkVersion:    opts.BellatrixForkVersionHex,
 		proposerSigningDomain:   proposerSigningDomain,
 		genesisValidatorRootHex: opts.GenesisValidatorRootHex,
-		simulationNodes:         opts.SimulationNodes,
+		recentBlocks:            []blockStat{},
+		simulationNodes:         strings.Split(opts.SimulationNodes, ","),
+		simulationNodeHighPerf:  opts.SimulationNodeHighPerf,
 		beaconNode:              *beaconNodeURL,
+
+		nextSlotWithdrawalsRoot: phase0.Root{},
+		nextSlotWithdrawals:     []*capella.Withdrawal{},
+		nextSlotWithdrawalsLock: sync.RWMutex{},
+
+		expectedBlockNumber: 0,
+
+		expectedPrevRandao:      randaoHelper{},
+		expectedPayloadDataLock: sync.RWMutex{},
+
+		demotedBuilderLock: sync.RWMutex{},
+		demotedBuilders:    syncmap.NewStringMapOf[string](),
+
+		topBlockMap: syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, int]](),
+
+		getPayloadRequestCutoffMs:   opts.GetPayloadRequestCutoffMs,
+		externalRelaysForComparison: opts.ExternalRelaysForComparison,
 
 		beaconClient:                   *beaconclient.NewMultiBeaconClient(opts.Log, beaconInstances),
 		bidTraceWithTimestampJSONCache: cache.New(time.Minute*30, time.Minute*30),
 		// TODO: possibly change providedHeaders back to hashmap.New[int64, []*types.GetHeaderResponse] after builder 'getValidators' implemented
-		providedHeaders: hashmap.New[int64, ProvidedHeaders](),
-		providedPayload: hashmap.New[int64, bool](),
-		builderIPs:      opts.BuilderIPs,
+		providedHeaders:               syncmap.NewIntegerMapOf[int64, ProvidedHeaders](),
+		providedPayload:               syncmap.NewIntegerMapOf[int64, bool](),
+		builderIPs:                    opts.BuilderIPs,
+		highPriorityBuilderDataLock:   sync.RWMutex{},
+		highPriorityBuilderPubkeys:    opts.HighPriorityBuilderPubkeys,
+		highPerfSimBuilderPubkeys:     opts.HighPerfSimBuilderPubkeys,
+		highPriorityBuilderAccountIDs: syncmap.NewStringMapOf[bool](),
+		highPriorityBuilderPubkeysToSkipSimulationThreshold:    syncmap.NewStringMapOf[*big.Int](),
+		highPriorityBuilderAccountIDsToSkipSimulationThreshold: syncmap.NewStringMapOf[*big.Int](),
+		ultraBuilderAccountIDs:                                 syncmap.NewStringMapOf[bool](),
+		noRateLimitUltraBuilderAccIDs:                          syncmap.NewStringMapOf[bool](),
 		httpClient: http.Client{
 			Timeout: opts.RelayRequestTimeout,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -341,42 +463,104 @@ func NewRelayService(opts RelayServiceOpts) (*RelayService, error) {
 			},
 			Timeout: opts.RelayRequestTimeout,
 		},
-		performanceStats:             NewPerformanceStats(),
-		proposerDutiesLock:           sync.RWMutex{}, // sync.RWMutex
-		proposerDutiesResponse:       make([]types.BuilderGetValidatorsResponseEntry, 0),
-		proposerDutiesSlot:           0,                         // uint64
-		isUpdatingProposerDuties:     uberatomic.NewBool(false), //uberatomic.Bool
-		latestFetchedSlotNumber:      0,
-		cloudServicesEndpoint:        opts.CloudServicesEndpoint,
-		cloudServicesAuthHeader:      opts.CloudServicesAuthHeader,
-		sendSlotProposerDuties:       opts.SendSlotProposerDuties,
-		relayType:                    opts.RelayType,
-		allProposerDuties:            make(map[uint64]beaconclient.ProposerDutiesResponseData),
-		allProposerDutiesLock:        sync.Mutex{},
-		latestSlotBlockReceived:      0,
-		getHeaderLatestDisabledSlot:  0,
-		rateLimiter:                  newRateLimiter(time.Second, 4),
-		emptyBeaconHeadEventTimer:    nil,
-		emptyBeaconHeadEventReceived: false,
+		performanceStats:                NewPerformanceStats(),
+		proposerDutiesLock:              sync.RWMutex{}, // sync.RWMutex
+		proposerDutiesResponse:          make([]types.BuilderGetValidatorsResponseEntry, 0),
+		proposerDutiesSlot:              0, // uint64
+		proposerDutiesMap:               syncmap.NewIntegerMapOf[uint64, *types.RegisterValidatorRequestMessage](),
+		isUpdatingProposerDuties:        uberatomic.NewBool(false), // uberatomic.Bool
+		latestFetchedSlotNumber:         0,
+		cloudServicesEndpoint:           opts.CloudServicesEndpoint,
+		cloudServicesAuthHeader:         opts.CloudServicesAuthHeader,
+		sendSlotProposerDuties:          opts.SendSlotProposerDuties,
+		relayType:                       opts.RelayType,
+		allProposerDuties:               syncmap.NewIntegerMapOf[uint64, beaconclient.ProposerDutiesResponseData](),
+		allProposerDutiesLock:           sync.Mutex{},
+		latestSlotBlockReceived:         uberatomic.NewUint64(0),
+		getHeaderLatestDisabledSlot:     uberatomic.NewUint64(0),
+		slotStartTimes:                  syncmap.NewIntegerMapOf[uint64, time.Time](),
+		getPayloadRequests:              syncmap.NewIntegerMapOf[uint64, requestInfo](),
+		getHeaderRequests:               syncmap.NewIntegerMapOf[uint64, []getHeaderRequestInfo](),
+		bestBlockBidForSlot:             syncmap.NewIntegerMapOf[uint64, v1.BidTrace](),
+		bestBloxrouteBlockBidForSlot:    syncmap.NewIntegerMapOf[uint64, v1.BidTrace](),
+		capellaForkEpoch:                opts.CapellaForkEpoch,
+		newBlockChannel:                 make(chan *saveBlockData, redisPubsubChannelSize),
+		newPayloadAttributesSlotChannel: make(chan uint64, redisPubsubChannelSize),
+		redisBlockSubChannel:            make(chan *redis.Message, redisPubsubChannelSize),
+		builderContextsForSlot:          syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, *builderContextData]](),
+		enableBidSaveCancellation:       opts.EnableBidSaveCancellation,
+
+		slotKeysToExpire: syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, bool]](),
+		keysToExpireChan: make(chan *syncmap.SyncMap[uint64, []string]),
+
+		tracer: opts.Tracer,
 	}
-	boostService.emptyBeaconHeadEventTimer = time.AfterFunc(emptyBeaconHeadEventTimerInterval, func() {
-		boostService.emptyBeaconHeadEventReceived = false
-	})
+
+	boostService.nodeUUID, err = uuid.NewV4()
+	if err != nil {
+		boostService.nodeUUID = uuid.UUID{}
+		boostService.log.Error("could not create UUID for this relay node, setting to empty", "error", err)
+	}
+
+	getGenesisResponse, err := boostService.GetGenesis()
+	if err != nil {
+		boostService.log.Error("could not fetch genesis", "error", err)
+	}
+
+	boostService.genesisInfo = *getGenesisResponse
+
+	go func() {
+		for {
+			keysToExpire := <-boostService.keysToExpireChan
+			keysToExpire.Range(func(slot uint64, keys []string) bool {
+				slotKeyMap, ok := boostService.slotKeysToExpire.Load(slot)
+				if !ok {
+					slotKeyMap = syncmap.NewStringMapOf[bool]()
+				}
+				for _, key := range keys {
+					slotKeyMap.Store(key, true)
+				}
+				boostService.slotKeysToExpire.Store(slot, slotKeyMap)
+				return true
+			})
+		}
+	}()
 
 	return boostService, nil
 }
 
-func (m *RelayService) respondError(w http.ResponseWriter, code int, message string) {
+func (m *BoostService) respondErrorWithLog(w http.ResponseWriter, code int, message string, log *logrus.Entry, logMessage string) {
+	log = log.WithFields(logrus.Fields{"resp_message": message, "resp_code": code})
+
+	// write either specific error message or use one for the response
+	if logMessage != "" {
+		log.Error(logMessage)
+	} else {
+		log.Error(message)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	resp := httpErrorResp{code, message}
+
+	resp := httpErrorResp{Code: code, Message: message}
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		m.log.WithField("response", resp).WithError(err).Error("Couldn't write error response")
+		log.WithError(err).Error("couldn't write error response")
 		http.Error(w, "", http.StatusInternalServerError)
 	}
 }
 
-func (m *RelayService) respondOK(w http.ResponseWriter, response any) {
+func (m *BoostService) respondError(w http.ResponseWriter, code int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+
+	resp := httpErrorResp{Code: code, Message: message}
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		m.log.WithError(err).Error("couldn't write error response")
+		http.Error(w, "", http.StatusInternalServerError)
+	}
+}
+
+func (m *BoostService) respondOK(w http.ResponseWriter, response any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(response); err != nil {
@@ -385,7 +569,13 @@ func (m *RelayService) respondOK(w http.ResponseWriter, response any) {
 	}
 }
 
-func (m *RelayService) getRouter() http.Handler {
+func (m *BoostService) respondEncodedJSON(w http.ResponseWriter, response []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(response)
+}
+
+func (m *BoostService) getRouter() http.Handler {
 	auth := NewAuth(m.log, m.certificatesPath, m.sdnURL, m.builderIPs)
 
 	r := mux.NewRouter()
@@ -401,37 +591,46 @@ func (m *RelayService) getRouter() http.Handler {
 
 	r.HandleFunc(pathStatus, m.handleStatus).Methods(http.MethodGet)
 	r.HandleFunc(pathRegisterValidator, m.handleRegisterValidator).Methods(http.MethodPost)
-	r.HandleFunc(pathGetHeader, m.handleGetHeader).Methods(http.MethodGet)
-	r.HandleFunc(pathGetPayload, m.handleGetPayload).Methods(http.MethodPost)
+	r.Handle(pathGetHeader, alice.New(rateLimitMiddleware(m.log, newRateLimiter(time.Minute, clientAllowedGetHeaderReqPerMin), getHeaderCaller)).
+		ThenFunc(m.handleGetHeader)).Methods(http.MethodGet)
 
-	r.HandleFunc(pathSubmitNewBlock, auth.whitelistIPMiddleware(auth.authMiddleware(m.handlePostBlock))).Methods(http.MethodPost)
+	r.HandleFunc(pathGetPayload, m.handleGetPayload).Methods(http.MethodPost)
+	r.HandleFunc(pathPutRelay, m.authMiddleware(m.handlePutRelay)).Methods(http.MethodPut)
+
+	r.Handle(pathSubmitNewBlock, alice.New(auth.whitelistIPMiddleware, auth.authMiddleware,
+		m.tierRateLimitMiddleware(newTierRateLimiters())).
+		ThenFunc(m.handlePostBlock)).Methods(http.MethodPost)
+
 	r.HandleFunc(pathBuilderGetValidators, m.handleBuilderGetValidators).Methods(http.MethodGet)
 
 	r.HandleFunc(pathDataProposerPayloadDelivered, m.handleDataProposerPayloadDelivered).Methods(http.MethodGet)
 	r.HandleFunc(pathDataBuilderBidsReceived, m.handleDataBuilderBidsReceived).Methods(http.MethodGet)
 	r.HandleFunc(pathDataValidatorRegistration, m.handleDataValidatorRegistration).Methods(http.MethodGet)
 
-	r.HandleFunc(pathBuilderDeleteBlocks, auth.whitelistIPMiddleware(m.handleBuilderDeleteBlocks)).Methods(http.MethodPost)
-	r.HandleFunc(pathBuilderDisableGetHeaderResponse, auth.whitelistIPMiddleware(m.handleBuilderDisableGetHeaderResponse)).Methods(http.MethodPost)
+	r.Handle(pathBuilderDeleteBlocks, alice.New(auth.whitelistIPMiddleware).ThenFunc(m.handleBuilderDeleteBlocks)).Methods(http.MethodPost)
+	r.Handle(pathBuilderDisableGetHeaderResponse, alice.New(auth.whitelistIPMiddleware).ThenFunc(m.handleBuilderDisableGetHeaderResponse)).Methods(http.MethodPost)
+
+	r.HandleFunc(pathGetActiveValidators, m.handleActiveValidators).Methods(http.MethodGet)
+	r.Handle(pathWebsocket, alice.New(auth.whitelistIPMiddleware, auth.authMiddleware).ThenFunc(m.HandleSocketConnection)).Methods(http.MethodGet)
+
+	r.Use(otelmux.Middleware("http-server"))
 
 	r.Use(mux.CORSMethodMiddleware(r))
-	r.Use(LogRequestID(m.log))
+	r.Use(LogRequestID(m))
 	r.Use(CheckKnownValidator(m))
 
-	loggedRouter := LoggingMiddlewareLogrus(m.log, r)
-
-	return loggedRouter
+	return recoveryMiddlewareWithLogs(m.log, r)
 }
 
 // StartHTTPServer starts the HTTP server for this boost service instance
-func (m *RelayService) StartHTTPServer() error {
+func (m *BoostService) StartHTTPServer() error {
 	if m.srv != nil {
 		return errServerAlreadyRunning
 	}
 
 	m.srv = &http.Server{
 		Addr:    m.listenAddr,
-		Handler: m.getRouter(),
+		Handler: otelhttp.NewHandler(m.getRouter(), "otel-http-handler"),
 
 		ReadTimeout:       0,
 		ReadHeaderTimeout: 0,
@@ -448,13 +647,13 @@ func (m *RelayService) StartHTTPServer() error {
 }
 
 //lint:ignore U1000 keep for future merging
-func (m *RelayService) handleRoot(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	m.respondOK(w, nilResponse)
 }
 
 // handleStatus sends calls to the status endpoint of every relay.
 // It returns OK if at least one returned OK, and returns error otherwise.
-func (m *RelayService) handleStatus(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleStatus(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	success := false
 	defer func() {
@@ -475,25 +674,29 @@ func (m *RelayService) handleStatus(w http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	log := m.log.WithFields(logrus.Fields{
+		"method": "status",
+	})
+
 	for _, r := range m.relays {
 		wg.Add(1)
 
-		go func(relay RelayEntry) {
+		go func(relay RelayEntry, log logrus.Entry) {
 			defer wg.Done()
-			url := relay.GetURI(pathStatus)
-			log := m.log.WithField("url", url)
-			log.Debug("Checking relay status")
+			uri := relay.GetURI(pathStatus)
+			logR := log.WithField("uri", uri)
+			logR.Trace("checking relay status")
 
-			_, err := SendHTTPRequest(ctx, m.httpClient, http.MethodGet, url, ua, nil, nil)
+			_, err := SendHTTPRequest(ctx, m.httpClient, http.MethodGet, uri, ua, nil, nil)
 			if err != nil && ctx.Err() != context.Canceled {
-				log.WithError(err).Error("failed to retrieve relay status")
+				logR.WithError(err).Error("failed to retrieve relay status")
 				return
 			}
 
 			// Success: increase counter and cancel all pending requests to other relays
 			atomic.AddUint32(&numSuccessRequestsToRelay, 1)
 			cancel()
-		}(r)
+		}(r, *log)
 	}
 
 	// At the end, wait for every routine and return status according to relay's ones.
@@ -503,153 +706,249 @@ func (m *RelayService) handleStatus(w http.ResponseWriter, req *http.Request) {
 		success = true
 		m.respondOK(w, nilResponse)
 	} else {
-		m.respondError(w, http.StatusServiceUnavailable, "all relays are unavailable")
+		m.respondErrorWithLog(w, http.StatusServiceUnavailable, "all relays are unavailable", log, "")
 	}
 }
 
 // RegisterValidatorV1 - returns 200 if at least one relay returns 200
-func (m *RelayService) handleRegisterValidator(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handlePutRelay(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
+	success := false
+	defer func() {
+		m.performanceStats.SetEndpointStats(pathPutRelay, uint64(time.Since(start).Microseconds()), success)
+	}()
+
+	log := m.log.WithFields(logrus.Fields{
+		"method":       "putRelay",
+		"requester-ip": req.RemoteAddr,
+	})
+
+	var payload PutRelayPayload
+	if err := decodeJSON(req.Body, &payload); err != nil {
+		m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "failed to decode request payload")
+		return
+	}
+	urls := m.parseRelayURLs(payload.URL)
+	for _, relay := range m.relays {
+		if urls[0].URL.String() == relay.URL.String() {
+			m.respondErrorWithLog(w, http.StatusBadRequest, "relay already known", log, "")
+			return
+		}
+	}
+	m.relays = append(m.relays, urls...)
+
+	success = true
+	m.respondOK(w, nilResponse)
+}
+
+// RegisterValidatorV1 - returns 200 if at least one relay returns 200
+func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	success := false
 	defer func() {
 		m.performanceStats.SetEndpointStats(pathRegisterValidator, uint64(time.Since(start).Microseconds()), success)
 	}()
-	log := m.log.WithField("method", "registerValidator")
-	log.Info("registerValidator")
 
-	payload := []types.SignedValidatorRegistration{}
-	if err := DecodeJSON(req.Body, &payload); err != nil {
-		m.respondError(w, http.StatusBadRequest, err.Error())
+	span := trace.SpanFromContext(req.Context())
+
+	log := m.log.WithFields(logrus.Fields{
+		"method": "registerValidator",
+	})
+
+	var registrations []types.SignedValidatorRegistration
+	if err := decodeJSONAndClose(req.Body, &registrations); err != nil {
+		m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "failed to decode request registrations")
 		return
 	}
 
-	validators := make(map[string]interface{})
+	log = log.WithField("numRegistrations", len(registrations))
+	span.SetAttributes(
+		attribute.String("method", "registerValidator"),
+		attribute.Int("numRegistrations", len(registrations)),
+	)
+	spanContext := trace.ContextWithSpan(req.Context(), span)
 
-	for _, registration := range payload {
-		if len(registration.Signature) != 96 {
-			m.respondError(w, http.StatusBadRequest, "invalid signature")
-			continue
-		}
-
-		if registration.Message == nil {
+	var registrationsPubKeys []string
+	for i := range registrations {
+		if registrations[i].Message == nil {
 			log.Debug("registration message is nil")
 			continue
 		}
-		payloadFeeRecipient := registration.Message.FeeRecipient.String()
-		payloadPublicKey := registration.Message.Pubkey.PubkeyHex()
+		registrationsPubKeys = append(registrationsPubKeys, registrations[i].Message.Pubkey.PubkeyHex().String())
+	}
 
-		// Check for a previous registration fee recipient
-		storedValidatorRegistration, err := m.datastore.GetValidatorRegistration(payloadPublicKey)
-		if err != nil {
-			log.Error("error retrieving stored validator registration", " err ", err)
-		}
+	storedValidatorRegistrations, err := m.datastore.GetValidatorRegistrations(spanContext, registrationsPubKeys)
+	if err != nil {
+		// even in case of error here, all the validators will be re-registered
+		log.WithError(err).Error("failed to get validator registrations")
+	}
 
-		// Skip signature verification if the fee recipient is the same
-		if storedValidatorRegistration != nil && storedValidatorRegistration.Message.FeeRecipient.String() == payloadFeeRecipient {
-			log.Tracef("validator public key %s and fee recipient %s validated from the cache", storedValidatorRegistration.Message.Pubkey.String(), payloadFeeRecipient)
+	storedRegistrations := make(map[string]types.SignedValidatorRegistration)
+	for i := range storedValidatorRegistrations {
+		storedRegistrations[storedValidatorRegistrations[i].Message.Pubkey.PubkeyHex().String()] = storedValidatorRegistrations[i]
+	}
+
+	validators := make(map[string]interface{})
+	activeValidators := make(map[string]interface{})
+
+	var validRegistrations []types.SignedValidatorRegistration
+
+	for i := range registrations {
+		if registrations[i].Message == nil {
+			log.Debug("registration message is nil")
 			continue
 		}
 
-		ok, err := types.VerifySignature(registration.Message, m.builderSigningDomain, registration.Message.Pubkey[:], registration.Signature[:])
+		// check for a previous registration fee recipient
+		storedValidatorRegistration, ok := storedRegistrations[registrations[i].Message.Pubkey.PubkeyHex().String()]
+
+		// skip signature verification if the fee recipient is the same
+		if ok && storedValidatorRegistration.Message.FeeRecipient.String() == registrations[i].Message.FeeRecipient.String() {
+			log.Tracef("validator public key %s and fee recipient %s validated from the cache",
+				storedValidatorRegistration.Message.Pubkey.String(), registrations[i].Message.FeeRecipient.String())
+
+			validRegistrations = append(validRegistrations, registrations[i])
+			activeValidators[registrations[i].Message.Pubkey.PubkeyHex().String()] = &datastore.ValidatorLatency{
+				Registration:   registrations[i],
+				LastRegistered: time.Now().UnixNano(),
+			}
+			continue
+		}
+
+		ok, err := types.VerifySignature(registrations[i].Message, m.builderSigningDomain,
+			registrations[i].Message.Pubkey[:], registrations[i].Signature[:])
 		if !ok || err != nil {
-			log.Error("error verifying signature", " err ", err, " ok ", ok)
-			m.respondError(w, http.StatusBadRequest, "invalid signature")
-			continue
+			if err != nil {
+				log = log.WithError(err)
+			}
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid signature", log, "")
+			return
 		} else {
-			go func(reg types.SignedValidatorRegistration) {
-				if err := m.datastore.SaveValidatorRegistration(registration); err != nil {
-					m.log.WithError(err).Error("could not save registration for validator", "pubkey", registration.Message.Pubkey.String())
-				}
-			}(registration)
-			validators[strings.ToLower(registration.Message.Pubkey.PubkeyHex().String())] = datastore.AliasSignedValidatorRegistration(registration)
+			validRegistrations = append(validRegistrations, registrations[i])
+			activeValidators[registrations[i].Message.Pubkey.PubkeyHex().String()] = &datastore.ValidatorLatency{
+				Registration:   registrations[i],
+				LastRegistered: time.Now().UnixNano(),
+			}
 		}
 	}
-	if len(validators) > 0 {
+	if len(activeValidators) > 0 {
 		go func() {
-			err := m.datastore.SetValidatorRegistrationMap(validators)
+			err := m.datastore.SetValidatorRegistrationMap(spanContext, activeValidators)
 			if err != nil {
-				m.log.WithError(err).Error("Failed to set validator registration")
+				log.WithError(err).Error("failed to set validator registration")
 			} else {
-				m.log.WithField("validator-count", len(validators)).Info("saved registration")
+				log.WithField("validator-count", len(validators)).Info("saved registration")
 			}
 		}()
 	}
+	go func() {
+		for _, registration := range validRegistrations {
+			go func(reg types.SignedValidatorRegistration) {
+				ctx, cancel := context.WithTimeout(spanContext, defaultDatabaseRequestTimeout)
+				defer cancel()
 
-	log = log.WithFields(logrus.Fields{
-		"numRegistrations": len(payload),
-		"timeNeededSec":    time.Since(start).Seconds(),
-	})
+				if err := m.db.SaveValidatorRegistration(ctx, reg); err != nil {
+					log.WithError(err).WithField("pubkey", reg.Message.Pubkey.String()).Error("could not save registration for validator")
+				}
+			}(registration)
+		}
+	}()
+
+	log.WithField("timeNeededSec", time.Since(start).Seconds()).Info("register validator")
+
 	success = true
 	m.respondOK(w, nilResponse)
-
 }
 
 // GetHeaderV1 TODO
-func (m *RelayService) handleGetHeader(w http.ResponseWriter, req *http.Request) {
-	start := time.Now()
+func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request) {
+	start := time.Now().UTC()
 	success := false
 	defer func() {
 		m.performanceStats.SetEndpointStats(pathGetHeaderPrefix, uint64(time.Since(start).Microseconds()), success)
 	}()
 
 	vars := mux.Vars(req)
-	slot := vars["slot"]
 	parentHashHex := vars["parent_hash"]
 	pubkey := vars["pubkey"]
 	log := m.log.WithFields(logrus.Fields{
 		"method":     "getHeader",
-		"slot":       slot,
+		"slot":       vars["slot"],
 		"parentHash": parentHashHex,
 		"pubkey":     pubkey,
 	})
-	log.Info("getHeader")
 
-	intSlot, err := strconv.ParseUint(slot, 10, 64)
+	span := trace.SpanFromContext(req.Context())
+	span.SetAttributes(
+		attribute.String("method", "getHeader"),
+		attribute.String("slot", vars["slot"]),
+		attribute.String("parentHash", parentHashHex),
+		attribute.String("pubkey", pubkey),
+	)
+
+	spanContext := trace.ContextWithSpan(req.Context(), span)
+
+	slot, err := strconv.ParseUint(vars["slot"], 10, 64)
 	if err != nil {
-		m.respondError(w, http.StatusBadRequest, errInvalidSlot.Error())
+		m.respondErrorWithLog(w, http.StatusBadRequest, errInvalidSlot.Error(), log.WithError(err), "")
 		return
 	}
 
 	if len(pubkey) != 98 {
-		m.respondError(w, http.StatusBadRequest, errInvalidPubkey.Error())
+		m.respondErrorWithLog(w, http.StatusBadRequest, errInvalidPubkey.Error(), log, fmt.Sprintf("pub key should be %d long", 98))
 		return
 	}
 
 	if len(parentHashHex) != 66 {
-		m.respondError(w, http.StatusBadRequest, errInvalidHash.Error())
+		m.respondErrorWithLog(w, http.StatusBadRequest, errInvalidHash.Error(), log, fmt.Sprintf("parent hash hex should be %d long", 66))
 		return
 	}
 
-	if intSlot <= m.getHeaderLatestDisabledSlot {
-		log.Infof("no header available, 'getHeader' requests disabled through slot %v, requested slot is %v", m.getHeaderLatestDisabledSlot, intSlot)
+	if slot <= m.getHeaderLatestDisabledSlot.Load() {
+		log.Errorf("no header available, 'getHeader' requests disabled through slot %v, requested slot is %v", m.getHeaderLatestDisabledSlot.Load(), slot)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
 	highestRankedRelay := new(string)
+	slotStartTimestamp := m.genesisInfo.Data.GenesisTime + (slot * 12)
+	msIntoSlot := start.UnixMilli() - int64(slotStartTimestamp*1000)
 
-	result := new(types.GetHeaderResponse)
-
-	slotBestHeader, err := m.datastore.GetGetHeaderResponse(intSlot, parentHashHex, pubkey)
+	fetchGetHeaderStartTime := time.Now().UTC()
+	slotBestHeaderRaw, slotBestHeader, dataSource, err := m.datastore.GetGetHeaderResponse(spanContext, slot, parentHashHex, pubkey)
 	if slotBestHeader == nil || err != nil {
-		log.Infof("no header available in datastore for slot: %v, parent hash: %v, proposer public key: %v, error: %v", intSlot, parentHashHex, pubkey, err)
+		log.Errorf("no header available in datastore for slot: %v, parent hash: %v, proposer public key: %v, error: %v", slot, parentHashHex, pubkey, err)
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	result = slotBestHeader
-	log.WithFields(logrus.Fields{
-		"slot":          fmt.Sprintf("%+v", intSlot),
-		"stored-header": fmt.Sprintf("%+v", *slotBestHeader.Data.Message.Header),
-		"bid-header":    fmt.Sprintf("%+v", *slotBestHeader.Data.Message.Header),
-		"bid-value":     fmt.Sprintf("%+v", weiToEth(slotBestHeader.Data.Message.Value.String())),
-		"bid-pubkey":    fmt.Sprintf("%+v", slotBestHeader.Data.Message.Pubkey),
-	}).Info("returning stored header")
+	if slotBestHeader.Capella == nil || slotBestHeader.Capella.Capella == nil || slotBestHeader.Capella.Capella.Message == nil || slotBestHeader.Capella.Capella.Message.Header == nil || slotBestHeader.Capella.Capella.Message.Header.BlockHash.String() == nilHash.String() {
+		log.Error("no bids received from relay")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	fetchGetHeaderDurationMS := time.Since(fetchGetHeaderStartTime).Milliseconds()
+
+	log = log.WithFields(logrus.Fields{
+		"bid-header-withdrawalroot": slotBestHeader.Capella.Capella.Message.Header.WithdrawalsRoot.String(),
+		"bid-header-parenthash":     slotBestHeader.Capella.Capella.Message.Header.ParentHash.String(),
+		"bid-header-blockhash":      slotBestHeader.Capella.Capella.Message.Header.BlockHash.String(),
+		"bid-value":                 common.WeiToEth(slotBestHeader.Capella.Capella.Message.Value.ToBig().String()),
+		"bid-pubkey":                slotBestHeader.Capella.Capella.Message.Pubkey.String(),
+	})
+
+	checkGetPayloadStartTime := time.Now().UTC()
+	getPayloadResponse, err := m.datastore.CheckGetPayloadResponse(spanContext, slot, slotBestHeader.Capella.Capella.Message.Header.BlockHash.String())
+	payload := getPayloadResponse.Capella
+	if payload == nil || payload.Capella == nil || err != nil {
+		log.Errorf("no payload in redis for the best available header for slot: %v, parent hash: %v, proposer public key: %v, error: %v", slot, parentHashHex, pubkey, err)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	checkGetPayloadDurationMS := time.Since(checkGetPayloadStartTime).Milliseconds()
 
 	go func() {
-		m.relayRankingsLock.Lock()
-		defer m.relayRankingsLock.Unlock()
-		ranking, ok := m.relayRankings[*highestRankedRelay]
+		ranking, ok := m.relayRankings.Load(*highestRankedRelay)
 		if !ok {
 			ranking = relayRanking{
 				HeaderRequests:    0,
@@ -657,478 +956,513 @@ func (m *RelayService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 			}
 		}
 		ranking.HighestValueCount = ranking.HighestValueCount + 1
-		m.relayRankings[*highestRankedRelay] = ranking
+		m.relayRankings.Store(*highestRankedRelay, ranking)
 	}()
-	if result.Data == nil || result.Data.Message == nil || result.Data.Message.Header == nil || result.Data.Message.Header.BlockHash == nilHash {
-		log.Info("no bids received from relay")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 
-	record := bestHeaderStatsRecord{
-		Data:              result.Data,
-		Slot:              slot,
-		ProposerPublicKey: pubkey,
-		Type:              "StatsBestHeader",
-	}
-	m.log.Info(record, time.Now(), "stats.best_header")
-
-	if m.isRelay {
-		result.Data.Message.Pubkey = m.pubKey
-		sig, err := types.SignMessage(result.Data.Message, m.builderSigningDomain, m.secretKey)
-		if err != nil {
-			log.Fatal("could not sign message")
+	go func() {
+		if m.stats.NodeID == "" {
+			return
 		}
-		result.Data.Signature = sig
-	}
 
-	if result.Data.Message.Header.FeeRecipient.String() == emptyWalletAddressOne || result.Data.Message.Header.FeeRecipient.String() == emptyWalletAddressZero {
-		log.Info("empty fee recipient")
-		m.respondError(w, http.StatusInternalServerError, "skipping due to empty wallet address")
+		mostProfitableBloxrouteBid, ok := m.bestBloxrouteBlockBidForSlot.Load(slot)
+		if !ok {
+			record := bestHeaderStatsRecord{
+				Data:                   slotBestHeader.Capella.Capella,
+				Slot:                   strconv.FormatUint(slot, 10),
+				ProposerPublicKey:      pubkey,
+				IsBloxrouteBlock:       m.isBloxrouteBlock(slotBestHeader.Capella.Capella.Message.Header.ExtraData),
+				BestBloxrouteValue:     "0",
+				BestBloxrouteValueDiff: big.NewInt(0).Sub(big.NewInt(0), slotBestHeader.Capella.Capella.Message.Value.ToBig()).String(),
+				BestBloxrouteBlockHash: "",
+				ExtraData:              common.DecodeExtraData(slotBestHeader.Capella.Capella.Message.Header.ExtraData),
+				Type:                   "StatsBestHeader",
+			}
+			m.stats.LogToFluentD(record, time.Now(), statsNameBestHeader)
+			return
+		}
+		bestBloxrouteValueDiff := new(big.Int).Sub(mostProfitableBloxrouteBid.Value.ToBig(), slotBestHeader.Capella.Capella.Message.Value.ToBig())
+
+		record := bestHeaderStatsRecord{
+			Data:                   slotBestHeader.Capella.Capella,
+			Slot:                   strconv.FormatUint(slot, 10),
+			ProposerPublicKey:      pubkey,
+			IsBloxrouteBlock:       m.isBloxrouteBlock(slotBestHeader.Capella.Capella.Message.Header.ExtraData),
+			BestBloxrouteValue:     mostProfitableBloxrouteBid.Value.String(),
+			BestBloxrouteValueDiff: bestBloxrouteValueDiff.String(),
+			BestBloxrouteBlockHash: mostProfitableBloxrouteBid.BlockHash.String(),
+			ExtraData:              common.DecodeExtraData(slotBestHeader.Capella.Capella.Message.Header.ExtraData),
+			Type:                   "StatsBestHeader",
+		}
+		m.stats.LogToFluentD(record, time.Now(), statsNameBestHeader)
+	}()
+
+	feeRecipient := slotBestHeader.Capella.Capella.Message.Header.FeeRecipient.String()
+	if feeRecipient == emptyWalletAddressOne || feeRecipient == emptyWalletAddressZero {
+		m.respondErrorWithLog(w, http.StatusInternalServerError, "skipping due to empty recipient wallet address", log, "")
 		return
 	}
+
+	// check if request is for latest slot and if so, store the getHeader request info;
+	// also store the request info if the latest slot is 0 (relay just started)
+	if slot == m.latestSlotBlockReceived.Load()+1 || m.latestSlotBlockReceived.Load() == 0 {
+		go func() {
+			storedRequests, _ := m.getHeaderRequests.Load(slot)
+			m.getHeaderRequests.Store(slot, append(storedRequests, getHeaderRequestInfo{
+				requestInfo: requestInfo{
+					timestamp: start,
+				},
+				pubkey:    pubkey,
+				blockHash: slotBestHeader.Capella.Capella.Message.Header.BlockHash.String(),
+			}))
+		}()
+	}
+
+	responseSendTime := time.Now().UTC()
+
+	log.WithFields(logrus.Fields{
+		"requestStartTime":          start.String(),
+		"responseSendTime":          responseSendTime.String(),
+		"durationUntilResponseMS":   responseSendTime.Sub(start).Milliseconds(),
+		"fetchGetHeaderStartTime":   fetchGetHeaderStartTime.String(),
+		"fetchGetHeaderDurationMS":  fetchGetHeaderDurationMS,
+		"fetchGetHeaderDataSource":  dataSource,
+		"checkGetPayloadStartTime":  checkGetPayloadStartTime.String(),
+		"checkGetPayloadDurationMS": checkGetPayloadDurationMS,
+		"blockHash":                 slotBestHeader.Capella.Capella.Message.Header.BlockHash.String(),
+		"slotStartSec":              slotStartTimestamp,
+		"msIntoSlot":                msIntoSlot,
+	}).Info("returning stored header")
 
 	success = true
-	m.respondOK(w, result)
+	m.respondEncodedJSON(w, slotBestHeaderRaw)
 
-	go func(getHeaderResponse *types.GetHeaderResponse) {
-		providedHeaders, ok := m.providedHeaders.Get(int64(intSlot))
+	go func(getHeaderResponse *common.GetHeaderResponse) {
+		providedHeaders, ok := m.providedHeaders.Load(int64(slot))
 		if !ok {
-			m.providedHeaders.Set(int64(intSlot), ProvidedHeaders{
-				Headers:           []*types.GetHeaderResponse{getHeaderResponse},
+			m.providedHeaders.Store(int64(slot), ProvidedHeaders{
+				Headers:           []*common.GetHeaderResponse{getHeaderResponse},
 				ProposerPublicKey: pubkey,
 			})
 		} else {
 			headers := append(providedHeaders.Headers, getHeaderResponse)
-			m.providedHeaders.Set(int64(intSlot), ProvidedHeaders{
+			m.providedHeaders.Store(int64(slot), ProvidedHeaders{
 				Headers:           headers,
 				ProposerPublicKey: pubkey,
 			})
 		}
-	}(result)
+	}(slotBestHeader)
 }
 
-func (m *RelayService) handleGetPayload(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	success := false
 	defer func() {
 		m.performanceStats.SetEndpointStats(pathGetPayload, uint64(time.Since(start).Microseconds()), success)
 	}()
-	log := m.log.WithField("method", "getPayload")
-	log.Info("getPayload")
+
+	log := m.log.WithFields(logrus.Fields{
+		"method": "getPayload",
+	})
+
+	span := trace.SpanFromContext(req.Context())
+	span.SetAttributes(
+		attribute.String("method", "getPayload"),
+	)
+
 	defer req.Body.Close()
 
-	payload := new(types.SignedBlindedBeaconBlock)
-	if err := json.NewDecoder(req.Body).Decode(&payload); err != nil {
-		m.log.Warn("could not process request body after responding")
-		m.respondError(w, http.StatusBadRequest, "failed to process payload request")
+	bodyBytes := bytes.NewBuffer(nil)
+	_, err := io.Copy(bodyBytes, req.Body)
+	if err != nil {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "could not process input", log.WithError(err), "")
+		return
+	}
+	span.AddEvent("readBody")
+
+	bodyString := bodyBytes.String()
+	blockHashIndex := strings.LastIndex(bodyString, "\"block_hash\"")
+
+	if blockHashIndex == -1 {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "invalid input", log, "block_hash not present")
 		return
 	}
 
+	payload := new(capellaapi.SignedBlindedBeaconBlock)
+	if err := decodeJSON(io.NopCloser(bodyBytes), &payload); err != nil {
+		m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log, "failed to decode request payload")
+		return
+	}
+	span.AddEvent("decodeBody")
+	slotStart := (m.genesisInfo.Data.GenesisTime + (uint64(payload.Message.Slot) * 12)) * 1000
+	currTime := time.Now().UTC().UnixMilli()
+	msIntoSlot := currTime - int64(slotStart)
+	log.WithField("msIntoSlot", msIntoSlot).Info("getPayload request received")
+	if msIntoSlot < 0 {
+		// Wait until slot start (t=0) if still in the future
+		_msSinceSlotStart := time.Now().UTC().UnixMilli() - int64((slotStart))
+		if _msSinceSlotStart < 0 {
+			delayMillis := (_msSinceSlotStart * -1) + int64(rand.Intn(50)) //nolint:gosec
+			log = log.WithField("delayMillis", delayMillis)
+			log.Info("waiting until slot start t=0")
+			time.Sleep(time.Duration(delayMillis) * time.Millisecond)
+			span.AddEvent("sleep")
+		}
+	} else if m.getPayloadRequestCutoffMs > 0 && msIntoSlot > int64(m.getPayloadRequestCutoffMs) {
+		log.WithField("time", currTime).Error("timestamp too late")
+		m.respondError(w, http.StatusBadRequest, "timestamp too late")
+		span.SetStatus(codes.Error, "timestamp too late")
+		return
+	}
+
+	proposerIndex := strconv.Itoa(int(payload.Message.ProposerIndex))
+	proposerKey, found := m.validatorsByIndex.Load(proposerIndex)
+
+	if !found {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "proposer index not found", log, "")
+		return
+	}
+
+	var pub types.PublicKey
+	err = pub.UnmarshalText([]byte(proposerKey))
+	if err != nil {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "invalid public key", log.WithError(err), "")
+		return
+	}
+
+	// verify the signature
+	ok, err := types.VerifySignature(payload.Message, m.proposerSigningDomain, pub[:], payload.Signature[:])
+	if !ok || err != nil {
+		if err != nil {
+			log = log.WithError(err)
+		}
+		m.respondErrorWithLog(w, http.StatusBadRequest, "invalid signature",
+			log.WithField("slot", payload.Message.Slot), "")
+		return
+	}
+
+	go func() {
+		m.getPayloadRequests.Store(uint64(payload.Message.Slot), requestInfo{
+			timestamp: start,
+		})
+	}()
+
 	blockHash := payload.Message.Body.ExecutionPayloadHeader.BlockHash
 
-	ctx, cancel := context.WithTimeout(req.Context(), databaseRequestTimeout)
-	defer cancel()
-
-	getPayloadResponse, err := m.datastore.GetGetPayloadResponse(ctx, payload.Message.Slot, blockHash.String())
-	if err != nil || getPayloadResponse == nil || getPayloadResponse.Data == nil {
-		m.log.WithFields(logrus.Fields{
+	getPayloadResponse, err := m.getGetPayloadResponse(uint64(payload.Message.Slot), blockHash.String())
+	if err != nil || getPayloadResponse == nil || getPayloadResponse.Capella == nil {
+		log.WithFields(logrus.Fields{
 			"slot": payload.Message.Slot,
 			"hash": blockHash.String(),
 		}).WithError(err).Error("could not get payload from memory, redis, or db")
-		m.log.Warn("block is not stored locally, fetching from relays directly")
+		span.AddEvent("could not get payload from memory, redis, or db")
 	} else {
-		log.WithFields(logrus.Fields{
+		log = log.WithFields(logrus.Fields{
 			"slot":           fmt.Sprintf("%+v", payload.Message.Slot),
 			"stored-payload": fmt.Sprintf("%+v", *getPayloadResponse),
-		}).Info("returning stored payload")
-		m.respondOK(w, getPayloadResponse)
+			"block-hash":     blockHash.String(),
+		})
+		if err := m.publishBlock(payload, getPayloadResponse.Capella.Capella); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				"block-contents": *payload,
+			}).Error("could not publish block")
+			m.respondError(w, http.StatusBadRequest, "failed to publish block")
+			return
+		}
+
+		log.Info("returning stored payload")
+		m.respondOK(w, getPayloadResponse.Capella)
+		span.AddEvent("responding with payload")
+
+		go func() {
+			log := m.log
+			blockSub, err := m.GetPayloadResponseToBlockSubmission(getPayloadResponse)
+			if err != nil {
+				log.WithError(err).Error("could not simulate block after responding")
+				return
+			}
+
+			slotDuty, ok := m.proposerDutiesMap.Load(blockSub.Slot())
+			if !ok {
+				log.WithError(err).Error("could not simulate block after responding, no slot duty")
+				return
+			}
+
+			simPayload := common.BuilderBlockValidationRequest{
+				BuilderSubmitBlockRequest: *blockSub,
+				RegisteredGasLimit:        slotDuty.GasLimit,
+			}
+
+			resChan := make(chan simulationResult)
+
+			nodes := []string{}
+			nodes = append(nodes, m.simulationNodeHighPerf)
+			nodes = append(nodes, m.simulationNodes...)
+
+			go m.simulate(context.Background(), log, &simPayload, nodes, resChan)
+			// if skipSimulation is true, then res channel will be closed and won't block further execution
+			simulationResult, ok := <-resChan
+			if ok {
+				log.Info("successful simulation for delivered payload")
+			} else {
+				log.WithField("simulationResult", simulationResult).Error("failed simulation for delivered payload")
+			}
+			close(resChan)
+		}()
 
 		// Save information about delivered payload
 		go func() {
-			providedHeaders, found := m.providedHeaders.Get(int64(payload.Message.Slot))
+			providedHeaders, found := m.providedHeaders.Load(int64(payload.Message.Slot))
 			if !found || providedHeaders.ProposerPublicKey == "" {
 				log.Warnf("proposer public key not found while attempting to save delivered payload for slot %v", payload.Message.Slot)
 			}
 			proposerPubkey := types.PubkeyHex(providedHeaders.ProposerPublicKey)
 
 			if m.db != nil {
-				err := m.db.SaveDeliveredPayload(payload.Message.Slot, proposerPubkey, blockHash, payload)
+				bidTrace, err := m.datastore.GetBidTrace(context.Background(), payload.Message.Body.ExecutionPayloadHeader.BlockHash.String())
 				if err != nil {
-					log.WithError(err).Error("failed to save delivered payload")
+					log.WithError(err).Error("failed to save delivered payload using redis, could not find bid trace")
+					return
+				}
+				if err := m.db.SaveDeliveredPayloadFromProvidedData(uint64(payload.Message.Slot), proposerPubkey, types.Hash(payload.Message.Body.ExecutionPayloadHeader.BlockHash), payload, bidTrace, getPayloadResponse.Capella); err != nil {
+					log.WithError(err).Error("failed to save delivered payload using redis")
+					return
 				}
 			}
-			if err := m.publishBlock(payload, getPayloadResponse.Data); err != nil {
-				m.log.WithError(err).WithField("block_hash", blockHash.String()).WithField("slot", payload.Message.Slot).WithField("block-contents", *payload).Error("could not publish block")
+			if err := m.datastore.SaveDeliveredPayloadBuilderRedis(context.Background(), uint64(payload.Message.Slot), payload.Message.Body.ExecutionPayloadHeader.BlockHash.String()); err != nil {
+				log.WithError(err).Error("failed to save builder delivered payload")
 			}
-			m.providedPayload.Set(int64(payload.Message.Slot), true)
+			m.providedPayload.Store(int64(payload.Message.Slot), true)
 		}()
+
+		if m.stats.NodeID == "" {
+			return
+		}
 
 		slot, proposer := uint64(0), uint64(0)
 		if payload.Message != nil {
-			slot = payload.Message.Slot
-			proposer = payload.Message.ProposerIndex
+			slot = uint64(payload.Message.Slot)
+			proposer = uint64(payload.Message.ProposerIndex)
 		}
 		log := payloadLog{
-			BlockNumber: getPayloadResponse.Data.BlockNumber,
-			Hash:        getPayloadResponse.Data.BlockHash.String(),
-			Slot:        slot,
-			Proposer:    proposer,
+			BlockNumber:      getPayloadResponse.Capella.Capella.BlockNumber,
+			Hash:             getPayloadResponse.Capella.Capella.BlockHash.String(),
+			Slot:             slot,
+			Proposer:         proposer,
+			IsBloxrouteBlock: m.isBloxrouteBlock(getPayloadResponse.Capella.Capella.ExtraData),
+			ExtraData:        common.DecodeExtraData(getPayloadResponse.Capella.Capella.ExtraData),
 		}
 
-		record := map[string]interface{}{
-			"data": log,
-			"type": "StatsBestPayload",
+		record := statistics.Record{
+			Data: log,
+			Type: "StatsBestPayload",
 		}
 
-		m.log.Info(record, time.Now(), "stats.best_payload")
+		m.stats.LogToFluentD(record, time.Now(), statsNameBestPayload)
+
 		return
 	}
 
-	result := new(types.GetPayloadResponse)
-	requestCtx, requestCtxCancel := context.WithCancel(context.Background())
-	defer requestCtxCancel()
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	ua := UserAgent(req.Header.Get("User-Agent"))
-
-	highestRankedRelay := new(string)
-	for _, relay := range m.relays {
-		wg.Add(1)
-		go func(relay RelayEntry) {
-			defer wg.Done()
-			url := relay.GetURI(pathGetPayload)
-			log := log.WithField("url", url)
-			log.Debug("calling getPayload")
-
-			responsePayload := new(types.GetPayloadResponse)
-			_, err := SendHTTPRequest(requestCtx, m.httpClient, http.MethodPost, url, ua, payload, responsePayload)
-
-			if err != nil {
-				log.WithError(err).Warn("error making request to relay")
-				return
-			}
-
-			if responsePayload.Data == nil || responsePayload.Data.BlockHash == nilHash {
-				log.Warn("invalid response")
-				return
-			}
-
-			// Lock before accessing the shared payload
-			mu.Lock()
-			defer mu.Unlock()
-
-			if requestCtx.Err() != nil { // request has been cancelled (or deadline exceeded)
-				return
-			}
-
-			// Ensure the response blockhash matches the request
-			if blockHash != responsePayload.Data.BlockHash {
-				log.WithFields(logrus.Fields{
-					"payloadBlockHash":  blockHash,
-					"responseBlockHash": responsePayload.Data.BlockHash,
-				}).Warn("requestBlockHash does not equal responseBlockHash")
-				return
-			}
-
-			// Received successful response. Now cancel other requests and return immediately
-			requestCtxCancel()
-			*highestRankedRelay = relay.String()
-			*result = *responsePayload
-			log.WithFields(logrus.Fields{
-				"blockHash":   responsePayload.Data.BlockHash,
-				"blockNumber": responsePayload.Data.BlockNumber,
-			}).Info("getPayload: received payload from relay")
-		}(relay)
-	}
-
-	// Wait for all requests to complete...
-	wg.Wait()
-
-	if result.Data == nil || result.Data.BlockHash == nilHash {
-		log.Warn("getPayload: no valid response from relay")
-		m.respondError(w, http.StatusBadGateway, errNoSuccessfulRelayResponse.Error())
-		return
-	}
-
-	// Save information about delivered payload
-	go func() {
-		providedHeaders, found := m.providedHeaders.Get(int64(payload.Message.Slot))
-		if !found || providedHeaders.ProposerPublicKey == "" {
-			log.Warnf("proposer public key not found while attempting to save delivered payload for slot %v", payload.Message.Slot)
-		}
-		proposerPubkey := types.PubkeyHex(providedHeaders.ProposerPublicKey)
-
-		if m.db != nil {
-			err := m.db.SaveDeliveredPayload(payload.Message.Slot, proposerPubkey, blockHash, payload)
-			if err != nil {
-				log.WithError(err).Error("failed to save delivered payload")
-			}
-		}
-	}()
-
-	logRecord := payloadLog{
-		BlockNumber: result.Data.BlockNumber,
-		Hash:        result.Data.BlockHash.String(),
-		Slot:        payload.Message.Slot,
-		Proposer:    payload.Message.ProposerIndex,
-	}
-
-	record := map[string]interface{}{
-		"data": logRecord,
-		"type": "StatsBestPayload",
-	}
-
-	m.log.Info(record, time.Now(), "stats.best_payload")
-	success = true
-	m.respondOK(w, result)
-
-	go func() {
-		if err := m.publishBlock(payload, result.Data); err != nil {
-			m.log.WithError(err).WithField("block_hash", result.Data.BlockHash).WithField("slot", payload.Message.Slot).Error("could not publish block")
-		}
-		m.providedPayload.Set(int64(payload.Message.Slot), true)
-	}()
+	m.respondError(w, http.StatusInternalServerError, "could not find requested payload")
 }
 
 // CheckRelays sends a request to each one of the relays previously registered to get their status
-func (m *RelayService) CheckRelays() bool {
+func (m *BoostService) CheckRelays() bool {
 	for _, relay := range m.relays {
-		m.log.WithField("relay", relay).Info("Checking relay")
-
-		url := relay.GetURI(pathStatus)
-		m.proposerDutiesLock.RLock()
-		defer m.proposerDutiesLock.RUnlock()
-		_, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodGet, url, "", nil, nil)
+		code, err := SendHTTPRequest(context.Background(), m.httpClient, http.MethodGet, relay.GetURI(pathStatus), "", nil, nil)
 		if err != nil {
-			m.log.WithError(err).WithField("relay", relay).Error("relay check failed")
+			m.log.WithError(err).WithField("relay", relay).Errorf("relay check failed, response code %d", code)
 			return false
 		}
+		m.log.WithError(err).WithField("relay", relay).Infof("relay check successful, response code %d", code)
 	}
 
 	return true
 }
 
-func (m *RelayService) handleBuilderGetValidators(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleBuilderGetValidators(w http.ResponseWriter, _ *http.Request) {
 	m.proposerDutiesLock.RLock()
 	defer m.proposerDutiesLock.RUnlock()
 	m.respondOK(w, m.proposerDutiesResponse)
 }
 
-func (m *RelayService) handlePostBlock(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handlePostBlock(w http.ResponseWriter, req *http.Request) {
+	start := time.Now().UTC()
+	success := false
+	defer func() {
+		m.performanceStats.SetEndpointStats(pathSubmitNewBlock, uint64(time.Since(start).Microseconds()), success)
+	}()
+
+	ctx, span := m.tracer.Start(req.Context(), "handlePostBlock")
+	defer span.End()
+	_, initialChecks := m.tracer.Start(ctx, "initialChecks")
+
 	var isExternalBuilder bool
 	var externalBuilderAccountID string
 
 	if checkThatRequestAuthorizedBy(req.Context(), headerAuth) {
 		isExternalBuilder = true
 		externalBuilderAccountID = getInfoFromRequest(req.Context(), accountIDKey).(string)
-		if !m.rateLimiter.canProcess(externalBuilderAccountID) {
-			m.respondError(w, http.StatusTooManyRequests, "rate limit exceeded")
+	}
+
+	clientIPAddress := common.GetIPXForwardedFor(req)
+
+	log := m.log.WithFields(logrus.Fields{
+		"builderIP":       req.RemoteAddr,
+		"clientIPAddress": clientIPAddress,
+		"method":          "submitNewBlock",
+	})
+
+	authInfo, ok := req.Context().Value(authInfoKey).(authInfo)
+	if !ok {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "could not get auth info", log, "could not decode payload")
+		return
+	}
+
+	tier, ok := authInfo[accountTier]
+	if !ok {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "could not get auth info", log, "could not decode payload")
+		return
+	}
+
+	if _, ok := tier.(sdnmessage.AccountTier); !ok {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "could not get auth info", log, "could not decode payload")
+		return
+	}
+
+	initialChecks.End()
+	span.SetAttributes(
+		attribute.String("builderIP", req.RemoteAddr),
+		attribute.String("clientIPAddress", clientIPAddress),
+		attribute.String("method", "submitNewBlock"),
+	)
+
+	_, marshalSpan := m.tracer.Start(ctx, "marshalPayload")
+
+	payloadBytes, err := ioutil.ReadAll(req.Body)
+	if err != nil {
+		m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "could not decode payload")
+		return
+	}
+	defer req.Body.Close()
+
+	payload := new(capellaBuilderAPI.SubmitBlockRequest)
+
+	if req.Header.Get("Content-Type") == "application/json" {
+		log = log.WithField("Content-Type", "json")
+		if err := payload.UnmarshalJSON(payloadBytes); err != nil {
+			m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "could not decode JSON payload")
+			marshalSpan.End()
+			return
+		}
+
+	} else {
+		log = log.WithField("Content-Type", "ssz")
+		if err := payload.UnmarshalSSZ(payloadBytes); err != nil {
+			m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "could not decode SSZ payload")
+			marshalSpan.End()
 			return
 		}
 	}
-
-	start := time.Now()
-	success := false
-	defer func() {
-		m.performanceStats.SetEndpointStats(pathSubmitNewBlock, uint64(time.Since(start).Microseconds()), success)
-	}()
-	log := m.log.WithField("method", "submitNewBlock")
-
-	payload := new(types.BuilderSubmitBlockRequest)
-	if err := json.NewDecoder(req.Body).Decode(payload); err != nil {
-		log.WithError(err).Error("could not decode payload")
-		m.respondError(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	marshalSpan.End()
 
 	if payload.Message == nil || payload.ExecutionPayload == nil {
-		m.respondError(w, http.StatusBadRequest, "skipping due to missing entries in the request")
+		m.respondErrorWithLog(w, http.StatusBadRequest, "skipping due to missing entries in the request", log, "invalid payload: either 'message' or 'execution_payload' are missing")
 		return
 	}
 
-	if payload.Message.ProposerFeeRecipient.String() == emptyWalletAddressZero {
-		m.respondError(w, http.StatusInternalServerError, "skipping due to empty fee recipient address")
+	var stat builderBlockReceivedStatsRecord
+	_, logSpan := m.tracer.Start(ctx, "fluentdLogger")
+	if m.stats.NodeID != "" {
+		stat = m.createBuilderBlockReceivedStatsRecord(common.GetIPXForwardedFor(req), externalBuilderAccountID, payload, isExternalBuilder)
+
+		defer func() {
+			m.stats.LogToFluentD(
+				statistics.Record{
+					Data: &stat,
+					Type: "NewBlockReceivedFromBuilder",
+				},
+				time.Now(),
+				statsNameNewBlockFromBuilder)
+		}()
+	}
+	logSpan.End()
+
+	if err := m.handleBlockPayload(ctx, log, payload, &stat, externalBuilderAccountID, isExternalBuilder, start, clientIPAddress, req.RemoteAddr, start, tier.(sdnmessage.AccountTier)); err != nil {
+		m.respondError(w, stat.HttpResponseCode, err.Error())
 		return
 	}
 
-	log = m.log.WithFields(logrus.Fields{
-		"builderIP":     req.RemoteAddr,
-		"builderPubKey": payload.Message.BuilderPubkey,
-		"blockHash":     payload.Message.BlockHash,
-		"slot":          payload.Message.Slot,
-		"value":         payload.Message.Value.String(),
-		"blockNumber":   payload.ExecutionPayload.BlockNumber,
-	})
+	m.respondOK(w, nilResponse)
+}
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	var simError error
-	var passed bool
+func (m *BoostService) simulate(ctx context.Context, log *logrus.Entry, payload *common.BuilderBlockValidationRequest, simulationNodes []string, res chan simulationResult) {
+	_, simSpan := m.tracer.Start(ctx, "blockSimulation")
+	defer close(res)
+	startTime := time.Now()
 
-	maxTimeout := time.NewTimer(800 * time.Millisecond)
-	go func(simErrPointer *error, payloadToSimulate *types.BuilderSubmitBlockRequest, passed *bool) {
-		defer wg.Done()
-		log.Trace("sending block for simulation")
+	log.WithField("simulation_nodes", simulationNodes).Trace("block simulation starting")
 
-		errChan := make(chan error)
-		passChan := make(chan bool)
+	maxTimeout := time.NewTimer(blockSimulationTimeout)
+	simRes := simulationResult{}
 
-		nodes := strings.Split(m.simulationNodes, ",")
+	errChan := make(chan error, len(simulationNodes))
+	passChan := make(chan fastestSimulator, len(simulationNodes))
 
-		for _, node := range nodes {
-			go func(nodeURL string) {
-				err := sendSim(payloadToSimulate, nodeURL)
-				if err != nil {
-					log.WithError(err).Error("block simulation failed")
-					*simErrPointer = err
-					errChan <- err
-					return
-				} else {
-					passChan <- true
-					*passed = true
-					return
-				}
-			}(node)
-		}
-
-		errorCount := 0
-
-		for {
-			select {
-			case <-maxTimeout.C:
-				*simErrPointer = errors.New("timeout while waiting for successful simulation response")
-				log.WithError(*simErrPointer).Error("block simulation timeout")
+	for _, node := range simulationNodes {
+		go func(nodeURL string) {
+			err := sendSim(ctx, payload, nodeURL)
+			if err != nil {
+				log.WithError(err).WithField("simulation_time", time.Since(startTime)).Error("block simulation failed")
+				errChan <- err
+				go m.datastore.SetBlockSubmissionStatus(ctx, payload.BlockHash(), datastore.BlockSimulationFailed)
 				return
-			case <-passChan:
-				return
-			case <-errChan:
-				errorCount++
-				if errorCount == len(nodes) {
-					return
+			} else {
+				passChan <- fastestSimulator{
+					nodeURL:  nodeURL,
+					duration: time.Since(startTime),
 				}
+				go m.datastore.SetBlockSubmissionStatus(ctx, payload.BlockHash(), datastore.BlockSimulationPassed)
+				return
+			}
+		}(node)
+	}
+
+	errorCount := 0
+
+	for {
+		select {
+		case <-maxTimeout.C:
+			simRes.duration = time.Since(startTime)
+			simRes.errors = append(simRes.errors, errSimulationTimeout)
+			log.WithError(errSimulationTimeout).Error("block simulation timeout")
+			simSpan.End()
+			res <- simRes
+			return
+		case fastest := <-passChan:
+			simRes.duration = fastest.duration
+			simRes.fastestNodeURL = &fastest.nodeURL
+			log.WithField("simulation_time", fastest.duration).Trace("block simulation finished")
+			simSpan.End()
+			res <- simRes
+			return
+		case err := <-errChan:
+			errorCount++
+			simRes.errors = append(simRes.errors, err)
+			if errorCount == len(simulationNodes) {
+				simRes.duration = time.Since(startTime)
+				simSpan.End()
+				res <- simRes
+				return
 			}
 		}
-	}(&simError, payload, &passed)
-
-	log.WithField("msg", payload.Message).Info("submit block payload")
-
-	log = log.WithFields(logrus.Fields{
-		"slot":      payload.Message.Slot,
-		"blockHash": payload.Message.BlockHash.String(),
-	})
-
-	// Sanity check the submission
-	err := verifyBuilderBlockSubmission(payload)
-	if err != nil {
-		log.WithError(err).Warn("block submission sanity checks failed")
-		m.respondError(w, http.StatusBadRequest, err.Error())
-		return
 	}
-
-	// Verify the signature
-	ok, err := types.VerifySignature(payload.Message, m.builderSigningDomain, payload.Message.BuilderPubkey[:], payload.Signature[:])
-	if !ok || err != nil {
-		log.WithError(err).Warnf("could not verify builder signature")
-		m.respondError(w, http.StatusBadRequest, "invalid signature")
-		return
-	}
-
-	header, err := types.PayloadToPayloadHeader(payload.ExecutionPayload)
-	if err != nil {
-		m.log.Fatal(err)
-	}
-
-	builderBid := types.BuilderBid{
-		Value:  payload.Message.Value,
-		Header: header,
-		Pubkey: m.pubKey,
-	}
-
-	sig, err := types.SignMessage(&builderBid, m.builderSigningDomain, m.secretKey)
-	if err != nil {
-		m.log.Fatal("could not sign message")
-	}
-	signedBuilderBid := types.SignedBuilderBid{
-		Message:   &builderBid,
-		Signature: sig,
-	}
-	signedBidTrace := types.SignedBidTrace{
-		Message:   payload.Message,
-		Signature: sig,
-	}
-
-	getHeaderResponse := types.GetHeaderResponse{
-		Version: "bellatrix",
-		Data:    &signedBuilderBid,
-	}
-
-	wg.Wait()
-
-	if !passed {
-		m.log.WithError(simError).Error("block failed simulation with error")
-		m.respondError(w, 400, fmt.Sprintf("block failed simulation with error: %v", simError))
-		return
-	}
-
-	go func() {
-		m.saveBlock(int64(payload.Message.Slot), *payload.ExecutionPayload, getHeaderResponse, *payload, &signedBidTrace)
-	}()
-
-	logFields := logrus.Fields{
-		"slot":           payload.Message.Slot,
-		"blockHash":      payload.Message.BlockHash.String(),
-		"parentHash":     payload.Message.ParentHash.String(),
-		"proposerPubkey": payload.Message.ProposerPubkey.String(),
-		"value":          weiToEth(payload.Message.Value.String()),
-		"tx":             len(payload.ExecutionPayload.Transactions),
-	}
-
-	stat := builderBlockReceivedStatsRecord{
-		Slot:                payload.Message.Slot,
-		BlockHash:           payload.Message.BlockHash.String(),
-		ParentHash:          payload.Message.ParentHash.String(),
-		BuilderPubkey:       payload.Message.BuilderPubkey.String(),
-		ProposerPubkey:      payload.Message.ProposerPubkey.String(),
-		Value:               payload.Message.Value,
-		TxCount:             len(payload.ExecutionPayload.Transactions),
-		AccountID:           "",
-		FromInternalBuilder: true,
-	}
-
-	if isExternalBuilder {
-		logFields["accountID"] = externalBuilderAccountID
-		stat.AccountID = fmt.Sprintf("%s", externalBuilderAccountID)
-		stat.FromInternalBuilder = false
-	}
-
-	log.WithFields(logFields).Info("received new block from builder")
-
-	record := map[string]interface{}{
-		"data": &stat,
-		"type": "NewBlockReceivedFromBuilder",
-	}
-	m.log.Info(record, time.Now(), "stats.new_block_from_builder")
-
-	// Respond with OK (TODO: proper response format)
-	success = true
-	w.WriteHeader(http.StatusOK)
-
-	go func() {
-		if _, ok := m.providedHeaders.Get(int64(payload.Message.Slot)); !ok {
-			m.providedHeaders.Set(int64(payload.Message.Slot), ProvidedHeaders{
-				Headers:           make([]*types.GetHeaderResponse, 0),
-				ProposerPublicKey: payload.Message.ProposerPubkey.String(),
-			})
-		}
-	}()
 }
 
 // -----------
 //  DATA APIS
 // -----------
 
-func (m *RelayService) handleDataProposerPayloadDelivered(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleDataProposerPayloadDelivered(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	success := false
 	defer func() {
@@ -1141,19 +1475,24 @@ func (m *RelayService) handleDataProposerPayloadDelivered(w http.ResponseWriter,
 		Limit: 100,
 	}
 
+	log := m.log.WithFields(logrus.Fields{
+		"clientIPAddress": common.GetIPXForwardedFor(req),
+		"method":          "getDataProposerPayloadDelivered",
+	})
+
 	if args.Get("slot") != "" && args.Get("cursor") != "" {
-		m.respondError(w, http.StatusBadRequest, "cannot specify both slot and cursor")
+		m.respondErrorWithLog(w, http.StatusBadRequest, "cannot specify both slot and cursor", m.log, "")
 		return
 	} else if args.Get("slot") != "" {
 		filters.Slot, err = strconv.ParseUint(args.Get("slot"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid slot argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid slot argument", log.WithError(err), "")
 			return
 		}
 	} else if args.Get("cursor") != "" {
 		filters.Cursor, err = strconv.ParseUint(args.Get("cursor"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid cursor argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid cursor argument", log.WithError(err), "")
 			return
 		}
 	}
@@ -1162,7 +1501,7 @@ func (m *RelayService) handleDataProposerPayloadDelivered(w http.ResponseWriter,
 		var hash types.Hash
 		err = hash.UnmarshalText([]byte(args.Get("block_hash")))
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid block_hash argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid block_hash argument", log.WithError(err), "")
 			return
 		}
 		filters.BlockHash = args.Get("block_hash")
@@ -1171,19 +1510,27 @@ func (m *RelayService) handleDataProposerPayloadDelivered(w http.ResponseWriter,
 	if args.Get("block_number") != "" {
 		filters.BlockNumber, err = strconv.ParseUint(args.Get("block_number"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid block_number argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid block_number argument", log.WithError(err), "")
 			return
 		}
+	}
+
+	if args.Get("builder_pubkey") != "" {
+		if err = checkBLSPublicKeyHex(args.Get("builder_pubkey")); err != nil {
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid builder_pubkey argument", log.WithError(err), "")
+			return
+		}
+		filters.BuilderPubkey = args.Get("builder_pubkey")
 	}
 
 	if args.Get("limit") != "" {
 		_limit, err := strconv.ParseUint(args.Get("limit"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid limit argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid limit argument", log.WithError(err), "")
 			return
 		}
 		if _limit > filters.Limit {
-			m.respondError(w, http.StatusBadRequest, fmt.Sprintf("maximum limit is %d", filters.Limit))
+			m.respondErrorWithLog(w, http.StatusBadRequest, fmt.Sprintf("maximum limit is %d", filters.Limit), log, "")
 			return
 		}
 		filters.Limit = _limit
@@ -1191,8 +1538,7 @@ func (m *RelayService) handleDataProposerPayloadDelivered(w http.ResponseWriter,
 
 	deliveredPayloads, err := m.db.GetRecentDeliveredPayloads(filters)
 	if err != nil {
-		m.log.WithError(err).Error("error getting recent payloads")
-		m.respondError(w, http.StatusInternalServerError, err.Error())
+		m.respondErrorWithLog(w, http.StatusInternalServerError, "error getting recent payloads", log.WithError(err), "")
 		return
 	}
 
@@ -1218,44 +1564,68 @@ func (m *RelayService) handleDataProposerPayloadDelivered(w http.ResponseWriter,
 	m.respondOK(w, response)
 }
 
-func (m *RelayService) handleDataBuilderBidsReceived(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleDataBuilderBidsReceived(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	success := false
 	defer func() {
 		m.performanceStats.SetEndpointStats(pathDataBuilderBidsReceived, uint64(time.Since(start).Microseconds()), success)
 	}()
 
+	log := m.log.WithFields(logrus.Fields{
+		"clientIPAddress": common.GetIPXForwardedFor(req),
+		"method":          "getDataBuilderBidsReceived",
+	})
+
 	var err error
 	args := req.URL.Query()
 
 	filters := database.GetBuilderSubmissionsFilters{
-		Limit:       100,
-		Slot:        0,
-		BlockHash:   "",
-		BlockNumber: 0,
+		Limit:         500,
+		Slot:          0,
+		BlockHash:     "",
+		BlockNumber:   0,
+		BuilderPubkey: "",
 	}
 
 	if args.Get("cursor") != "" {
-		m.respondError(w, http.StatusBadRequest, "cursor argument not supported on this API")
+		m.respondErrorWithLog(w, http.StatusBadRequest, "cursor argument not supported on this API", log, "")
 		return
 	}
 
 	if args.Get("slot") != "" && args.Get("cursor") != "" {
-		m.respondError(w, http.StatusBadRequest, "cannot specify both slot and cursor")
+		m.respondErrorWithLog(w, http.StatusBadRequest, "cannot specify both slot and cursor", log, "")
 		return
 	} else if args.Get("slot") != "" {
 		filters.Slot, err = strconv.ParseUint(args.Get("slot"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid slot argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid slot argument", log.WithError(err), "")
 			return
 		}
+	}
+
+	if args.Get("builder_pubkey") != "" {
+		err = checkBLSPublicKeyHex(args.Get("builder_pubkey"))
+		if err != nil {
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid builder_pubkey argument", log.WithError(err), "")
+			return
+		}
+		filters.BuilderPubkey = args.Get("builder_pubkey")
+	}
+
+	// if the current slot we are building for is requested, return empty
+	currentSlot := m.latestSlotBlockReceived.Load() + 1
+	if filters.Slot >= currentSlot {
+		response := make([]BidTraceWithTimestampJSON, 0)
+		success = true
+		m.respondOK(w, response)
+		return
 	}
 
 	if args.Get("block_hash") != "" {
 		var hash types.Hash
 		err = hash.UnmarshalText([]byte(args.Get("block_hash")))
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid block_hash argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid block_hash argument", log.WithError(err), "")
 			return
 		}
 		filters.BlockHash = args.Get("block_hash")
@@ -1264,19 +1634,25 @@ func (m *RelayService) handleDataBuilderBidsReceived(w http.ResponseWriter, req 
 	if args.Get("block_number") != "" {
 		filters.BlockNumber, err = strconv.ParseUint(args.Get("block_number"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid block_number argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid block_number argument", log.WithError(err), "")
 			return
 		}
+	}
+
+	// at least one query arguments is required
+	if filters.Slot == 0 && filters.BlockHash == "" && filters.BlockNumber == 0 && filters.BuilderPubkey == "" {
+		m.respondErrorWithLog(w, http.StatusBadRequest, "need to query for specific slot or block_hash or block_number or builder_pubkey", log.WithError(err), "")
+		return
 	}
 
 	if args.Get("limit") != "" {
 		_limit, err := strconv.ParseUint(args.Get("limit"), 10, 64)
 		if err != nil {
-			m.respondError(w, http.StatusBadRequest, "invalid limit argument")
+			m.respondErrorWithLog(w, http.StatusBadRequest, "invalid limit argument", log.WithError(err), "")
 			return
 		}
 		if _limit > filters.Limit {
-			m.respondError(w, http.StatusBadRequest, fmt.Sprintf("maximum limit is %d", filters.Limit))
+			m.respondErrorWithLog(w, http.StatusBadRequest, fmt.Sprintf("maximum limit is %d", filters.Limit), log, "")
 			return
 		}
 		filters.Limit = _limit
@@ -1320,13 +1696,17 @@ func (m *RelayService) handleDataBuilderBidsReceived(w http.ResponseWriter, req 
 	}
 
 	if err != nil {
-		m.log.WithError(err).Error("error getting recent payloads")
-		m.respondError(w, http.StatusInternalServerError, err.Error())
+		m.respondErrorWithLog(w, http.StatusInternalServerError, "error getting recent payloads", log.WithError(err), "")
 		return
 	}
 
 	response := []BidTraceWithTimestampJSON{}
 	for _, payload := range deliveredPayloads {
+		// remove current slot payloads from response
+		if payload.Slot == currentSlot {
+			continue
+		}
+
 		trace := BidTraceWithTimestampJSON{
 			Timestamp:   payload.InsertedAt.Unix(),
 			TimestampMs: payload.InsertedAt.UnixMilli(),
@@ -1341,7 +1721,7 @@ func (m *RelayService) handleDataBuilderBidsReceived(w http.ResponseWriter, req 
 				GasUsed:              payload.GasUsed,
 				Value:                payload.Value,
 				NumTx:                uint64(payload.NumTx),
-				BlockNumber:          uint64(payload.BlockNumber),
+				BlockNumber:          payload.BlockNumber,
 			},
 		}
 		response = append(response, trace)
@@ -1355,28 +1735,31 @@ func (m *RelayService) handleDataBuilderBidsReceived(w http.ResponseWriter, req 
 	m.respondOK(w, response)
 }
 
-func (m *RelayService) handleDataValidatorRegistration(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleDataValidatorRegistration(w http.ResponseWriter, req *http.Request) {
 	start := time.Now()
 	success := false
 	defer func() {
 		m.performanceStats.SetEndpointStats(pathDataValidatorRegistration, uint64(time.Since(start).Microseconds()), success)
 	}()
 
+	log := m.log.WithFields(logrus.Fields{
+		"clientIPAddress": common.GetIPXForwardedFor(req),
+		"method":          "getDataValidatorRegistration",
+	})
+
 	pkStr := req.URL.Query().Get("pubkey")
 	if pkStr == "" {
-		m.respondError(w, http.StatusBadRequest, "missing pubkey argument")
+		m.respondErrorWithLog(w, http.StatusBadRequest, "missing pubkey argument", log, "")
 		return
 	}
 
-	registration, err := m.redis.GetValidatorRegistration(types.NewPubkeyHex(pkStr))
+	registration, err := m.datastore.GetValidatorRegistration(req.Context(), types.NewPubkeyHex(pkStr))
 	if err != nil {
-		m.log.WithError(err).Error("error getting validator registration")
-		m.respondError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	if registration == nil {
-		m.respondError(w, http.StatusBadRequest, "no registration found for validator "+pkStr)
+		if errors.Is(err, datastore.ErrValidatorRegistrationNotFound) {
+			m.respondErrorWithLog(w, http.StatusNotFound, "no registration found for validator "+pkStr, log, "")
+			return
+		}
+		m.respondErrorWithLog(w, http.StatusInternalServerError, "error getting validator registration", log.WithError(err), "")
 		return
 	}
 
@@ -1384,7 +1767,7 @@ func (m *RelayService) handleDataValidatorRegistration(w http.ResponseWriter, re
 	m.respondOK(w, registration)
 }
 
-func (m *RelayService) updateProposerDuties(headSlot uint64) {
+func (m *BoostService) updateProposerDuties(headSlot uint64) {
 	// Ensure only one updating is running at a time
 	if m.isUpdatingProposerDuties.Swap(true) {
 		return
@@ -1421,25 +1804,13 @@ func (m *RelayService) updateProposerDuties(headSlot uint64) {
 		log.WithError(err).Error("failed to get proposer duties for next epoch for all beacon nodes")
 	}
 
-	// Validator registrations are queried in parallel, and this is the result struct
-	type result struct {
-		val types.BuilderGetValidatorsResponseEntry
-		err error
-	}
-
-	// Scatter requests to Redis to get validator registrations
-	c := make(chan result, len(entries))
-	allProposerDuties := make(map[uint64]beaconclient.ProposerDutiesResponseData)
-	for i := 0; i < cap(c); i++ {
-		go func(duty beaconclient.ProposerDutiesResponseData) {
-			reg, err := m.redis.GetValidatorRegistration(types.NewPubkeyHex(duty.Pubkey))
-			c <- result{types.BuilderGetValidatorsResponseEntry{
-				Slot:  duty.Slot,
-				Entry: reg,
-			}, err}
-		}(entries[i])
-
-		allProposerDuties[entries[i].Slot] = entries[i]
+	allProposerDuties := syncmap.NewIntegerMapOf[uint64, beaconclient.ProposerDutiesResponseData]()
+	pubKeys := make([]string, len(entries))
+	pubKeysSlots := make(map[string]uint64)
+	for i := range entries {
+		allProposerDuties.Store(entries[i].Slot, entries[i])
+		pubKeys[i] = types.NewPubkeyHex(entries[i].Pubkey).String()
+		pubKeysSlots[pubKeys[i]] = entries[i].Slot
 	}
 
 	// save future proposer duties including index and pubkey to send to cloud services
@@ -1447,55 +1818,68 @@ func (m *RelayService) updateProposerDuties(headSlot uint64) {
 	m.allProposerDuties = allProposerDuties
 	m.allProposerDutiesLock.Unlock()
 
-	// Gather results
-	proposerDuties := make([]types.BuilderGetValidatorsResponseEntry, 0)
-	for i := 0; i < cap(c); i++ {
-		res := <-c
-		if res.err != nil {
-			log.WithError(res.err).Error("error in loading validator registration from redis")
-		} else if res.val.Entry != nil { // only if a known registration
-			proposerDuties = append(proposerDuties, res.val)
+	var proposerDuties []types.BuilderGetValidatorsResponseEntry
+	proposerDutiesMap := syncmap.NewIntegerMapOf[uint64, *types.RegisterValidatorRequestMessage]()
+
+	b := backoff.NewExponentialBackOff()
+	b.MaxElapsedTime = getValidatorRegistrationsMaxElapsedTime
+	b.MaxInterval = backoff.DefaultInitialInterval
+
+	var res []types.SignedValidatorRegistration
+
+	err = backoff.Retry(func() error {
+		var err error
+		res, err = m.datastore.GetValidatorRegistrations(context.Background(), pubKeys)
+		if err != nil {
+			log.WithError(err).Error("failed attempt to get validator registrations")
+			return err
 		}
+		return nil
+	}, b)
+	if err != nil {
+		log.WithError(err).Error("failed to get validator registrations, proposer duties won't be updated")
+		return
 	}
 
-	if err == nil {
-		m.proposerDutiesLock.Lock()
-		m.proposerDutiesResponse = proposerDuties
-		m.proposerDutiesSlot = headSlot
-		m.proposerDutiesLock.Unlock()
-
-		// pretty-print
-		_duties := make([]string, len(proposerDuties))
-		for i, duty := range proposerDuties {
-			_duties[i] = fmt.Sprint(duty.Slot)
+	proposerDuties = make([]types.BuilderGetValidatorsResponseEntry, len(res))
+	for i := range res {
+		proposerDuties[i] = types.BuilderGetValidatorsResponseEntry{
+			Slot:  pubKeysSlots[res[i].Message.Pubkey.PubkeyHex().String()],
+			Entry: &res[i],
 		}
-		sort.Strings(_duties)
-		m.log.Infof("proposer duties updated: %s", strings.Join(_duties, ", "))
-	} else {
-		m.log.WithError(err).Error("failed to update proposer duties")
+		proposerDutiesMap.Store(pubKeysSlots[res[i].Message.Pubkey.PubkeyHex().String()], res[i].Message)
 	}
-}
 
-// GetProposerDuties returns proposer duties for every slot in this epoch
-// https://ethereum.github.io/beacon-APIs/#/Validator/getProposerDuties
-func (m *RelayService) GetProposerDuties(epoch uint64) (*proposerDutiesResponse, error) {
-	uri := fmt.Sprintf("http://%v/eth/v1/validator/duties/proposer/%d", m.beaconNode.Host, epoch)
-	resp := &proposerDutiesResponse{}
-	_, err := fetchBeacon(http.MethodGet, uri, nil, resp)
-	return resp, err
+	m.proposerDutiesLock.Lock()
+	m.proposerDutiesResponse = proposerDuties
+	m.proposerDutiesMap = proposerDutiesMap
+	m.proposerDutiesSlot = headSlot
+	m.proposerDutiesLock.Unlock()
+
+	// pretty-print
+	duties := make([]string, len(proposerDuties))
+	for i, duty := range proposerDuties {
+		duties[i] = fmt.Sprint(duty.Slot)
+	}
+	sort.Strings(duties)
+
+	log.WithFields(logrus.Fields{
+		"proposerDutiesCount":    len(proposerDuties),
+		"allProposerDutiesCount": len(allProposerDuties.Keys()),
+	}).Infof("proposer duties updated: %s", strings.Join(duties, ", "))
 }
 
 // SendCloudServicesHTTPRequest - prepare and send HTTP request, marshaling the payload if any, and decoding the response if dst is set
-func (m *RelayService) SendCloudServicesHTTPRequest(ctx context.Context, client http.Client, payload any, dst any) (code int, err error) {
+func (m *BoostService) SendCloudServicesHTTPRequest(ctx context.Context, client http.Client, payload any, dst any) (code int, err error) {
 	var req *http.Request
 
 	if payload == nil {
-		log.Error("payload for cloud services HTTP request cannot be nil")
+		m.log.Error("payload for cloud services HTTP request cannot be nil")
 		return http.StatusNoContent, errors.New("payload for cloud services HTTP request cannot be nil")
 	}
 
 	if m.cloudServicesAuthHeader == "" {
-		log.Error("cloud services authorization header cannot be empty")
+		m.log.Error("cloud services authorization header cannot be empty")
 		return http.StatusNoContent, errors.New("cloud services authorization header cannot be empty")
 	}
 
@@ -1547,45 +1931,80 @@ func (m *RelayService) SendCloudServicesHTTPRequest(ctx context.Context, client 
 }
 
 // handleBuilderDeleteBlocks deletes blocks from the datastore and updates the best header if needed
-func (m *RelayService) handleBuilderDeleteBlocks(w http.ResponseWriter, req *http.Request) {
-	log := m.log.WithField("method", "deleteBlocks")
-	deleteBlocksPayload := new(DeleteBidPayload)
+func (m *BoostService) handleBuilderDeleteBlocks(w http.ResponseWriter, req *http.Request) {
+	log := m.log.WithFields(logrus.Fields{
+		"clientIPAddress": common.GetIPXForwardedFor(req),
+		"method":          "deleteBlocks",
+	})
 
+	deleteBlocksPayload := new(DeleteBidPayload)
 	if err := json.NewDecoder(req.Body).Decode(deleteBlocksPayload); err != nil {
-		log.WithError(err).Error("could not decode payload")
-		m.respondError(w, http.StatusBadRequest, err.Error())
+		m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "failed to decode request payload")
 		return
 	}
 
-	log.Info("delete bids requested", "numBids", len(deleteBlocksPayload.BlockHashes))
+	log.Trace("delete bids requested", "numBids", len(deleteBlocksPayload.BlockHashes))
 
-	hashes := map[string]bool{}
+	hashes := make(map[string]struct{})
 	for _, hash := range deleteBlocksPayload.BlockHashes {
-		hashes[hash] = true
+		hashes[hash] = struct{}{}
 	}
 
-	if err := m.datastore.DeleteBlockSubmissions(deleteBlocksPayload.Slot, deleteBlocksPayload.ParentHash, deleteBlocksPayload.Pubkey, hashes); err != nil {
-		m.respondError(w, http.StatusInternalServerError, "could not delete bid")
+	err := m.datastore.DeleteBlockSubmissions(req.Context(), deleteBlocksPayload.Slot, deleteBlocksPayload.ParentHash, deleteBlocksPayload.Pubkey, hashes)
+	if err != nil {
+		m.respondErrorWithLog(w, http.StatusInternalServerError, "could not delete bid", log.WithError(err), "")
 		return
 	}
 
 	m.respondOK(w, nilResponse)
 }
 
+func (m *BoostService) handleActiveValidators(w http.ResponseWriter, req *http.Request) {
+	activeValidatorsCount, err := m.datastore.GetActiveValidators(req.Context())
+	if err != nil {
+		m.respondErrorWithLog(w, http.StatusInternalServerError, "could not get active validators",
+			m.log.WithField("method", "activeValidators").WithError(err), "")
+		return
+	}
+	m.respondOK(w, map[string]int{"activeValidators": activeValidatorsCount})
+}
+
 // handleBuilderDisableGetHeaderResponse deletes blocks from the datastore and updates the best header if needed
-func (m *RelayService) handleBuilderDisableGetHeaderResponse(w http.ResponseWriter, req *http.Request) {
+func (m *BoostService) handleBuilderDisableGetHeaderResponse(w http.ResponseWriter, req *http.Request) {
 	latestDisabledSlotUpdated := false
-	if m.getHeaderLatestDisabledSlot <= m.latestSlotBlockReceived {
-		m.getHeaderLatestDisabledSlot = m.latestSlotBlockReceived + disableGetHeaderResponseSlotInterval
+	if m.getHeaderLatestDisabledSlot.Load() <= m.latestSlotBlockReceived.Load() {
+		m.getHeaderLatestDisabledSlot.Add(m.latestSlotBlockReceived.Load() + disableGetHeaderResponseSlotInterval)
 		latestDisabledSlotUpdated = true
 	}
 
 	m.log.WithFields(logrus.Fields{
+		"clientIPAddress":           common.GetIPXForwardedFor(req),
+		"method":                    "postBuilderDisableGetHeaderResponse",
 		"remoteAddress":             req.RemoteAddr,
-		"currentSlot":               m.latestSlotBlockReceived + 1,
-		"latestDisabledSlot":        m.getHeaderLatestDisabledSlot,
+		"currentSlot":               m.latestSlotBlockReceived.Load() + 1,
+		"latestDisabledSlot":        m.getHeaderLatestDisabledSlot.Load(),
 		"latestDisabledSlotUpdated": latestDisabledSlotUpdated,
 	}).Info("BuilderDisableGetHeaderResponse called")
 
 	m.respondOK(w, "success")
+}
+
+// StartConfigFilesLoading loads data from config files continuously based on 'configFilesUpdateInterval'
+func (m *BoostService) StartConfigFilesLoading() {
+	m.loadConfigFiles()
+	ticker := time.NewTicker(configFilesUpdateInterval)
+	for {
+		<-ticker.C
+		m.loadConfigFiles()
+	}
+}
+
+// loadConfigFiles loads data from config files
+func (m *BoostService) loadConfigFiles() {
+	go m.loadHighPriorityBuilderData()
+}
+
+// isBloxrouteBlock checks block ExtraData to determine if the block was built by bloXroute
+func (m *BoostService) isBloxrouteBlock(extraData types.ExtraData) bool {
+	return extraData.String() == bloxrouteExtraData
 }

@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/bloXroute-Labs/mev-relay/common"
 	"github.com/flashbots/go-boost-utils/types"
 	"github.com/r3labs/sse"
 	"github.com/sirupsen/logrus"
@@ -32,6 +34,27 @@ type HeadEventData struct {
 	State string `json:"state"`
 }
 
+type PayloadAttributes struct {
+	Timestamp             uint64                `json:"timestamp,string"`
+	PrevRandao            string                `json:"prev_randao"`
+	SuggestedFeeRecipient string                `json:"suggested_fee_recipient"`
+	Withdrawals           []*capella.Withdrawal `json:"withdrawals"`
+}
+
+type PayloadAttributesData struct {
+	ProposerIndex     uint64            `json:"proposer_index,string"`
+	ProposalSlot      uint64            `json:"proposal_slot,string"`
+	ParentBlockNumber uint64            `json:"parent_block_number,string"`
+	ParentBlockRoot   string            `json:"parent_block_root"`
+	ParentBlockHash   string            `json:"parent_block_hash"`
+	PayloadAttributes PayloadAttributes `json:"payload_attributes"`
+}
+
+type PayloadAttributesEvent struct {
+	Version string                `json:"version"`
+	Data    PayloadAttributesData `json:"data"`
+}
+
 func (c *ProdBeaconInstance) SubscribeToHeadEvents(slotC chan HeadEventData) {
 	eventsURL := fmt.Sprintf("%s/eth/v1/events?topics=head", c.beaconURI)
 	log := c.log.WithField("url", eventsURL)
@@ -41,11 +64,38 @@ func (c *ProdBeaconInstance) SubscribeToHeadEvents(slotC chan HeadEventData) {
 		client := sse.NewClient(eventsURL)
 		err := client.SubscribeRaw(func(msg *sse.Event) {
 			var data HeadEventData
-			err := json.Unmarshal(msg.Data, &data)
-			if err != nil {
-				log.WithError(err).Error("could not unmarshal head event, sending empty head event to channel")
+			if len(msg.Data) > 0 {
+				err := json.Unmarshal(msg.Data, &data)
+				if err != nil {
+					log.WithError(err).WithField("raw_data", string(msg.Data)).Error("could not unmarshal head event")
+				}
 			}
 			slotC <- data
+		})
+		if err != nil {
+			log.WithError(err).Error("failed to subscribe to head events")
+			time.Sleep(1 * time.Second)
+		}
+		c.log.Warn("beaconclient SubscribeRaw ended, reconnecting")
+	}
+}
+
+func (c *ProdBeaconInstance) SubscribeToPayloadAttributes(payloadAttributesChan chan PayloadAttributesData) {
+	eventsURL := fmt.Sprintf("%s/eth/v1/events?topics=payload_attributes", c.beaconURI)
+	log := c.log.WithField("url", eventsURL)
+	log.Info("subscribing to payload attributes events")
+
+	for {
+		client := sse.NewClient(eventsURL)
+		err := client.SubscribeRaw(func(msg *sse.Event) {
+			var data PayloadAttributesEvent
+			if len(msg.Data) > 0 {
+				err := json.Unmarshal(msg.Data, &data)
+				if err != nil {
+					log.WithError(err).WithField("raw_data", string(msg.Data)).Error("could not unmarshal head event")
+				}
+			}
+			payloadAttributesChan <- data.Data
 		})
 		if err != nil {
 			log.WithError(err).Error("failed to subscribe to head events")
@@ -204,7 +254,35 @@ func (c *ProdBeaconInstance) GetURI() string {
 	return c.beaconURI
 }
 
-func (c *ProdBeaconInstance) PublishBlock(block *types.SignedBeaconBlock) (code int, err error) {
+type GetWithdrawalsResponse struct {
+	Data struct {
+		Withdrawals []*capella.Withdrawal `json:"withdrawals"`
+	}
+}
+
+// GetWithdrawals - /eth/v1/beacon/states/<slot>/withdrawals
+func (c *ProdBeaconInstance) GetWithdrawals(slot uint64) (withdrawalsResp *GetWithdrawalsResponse, err error) {
+	uri := fmt.Sprintf("%s/eth/v1/beacon/states/%d/withdrawals", c.beaconURI, slot)
+	resp := new(GetWithdrawalsResponse)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp)
+	return resp, err
+}
+
+func (c *ProdBeaconInstance) PublishBlock(block *capella.SignedBeaconBlock) (code int, err error) {
 	uri := fmt.Sprintf("%s/eth/v1/beacon/blocks", c.beaconURI)
 	return fetchBeacon(http.MethodPost, uri, block, nil)
+}
+
+type GetRandaoResponse struct {
+	Data struct {
+		Randao string `json:"randao"`
+	}
+}
+
+// GetSlotBlock - /eth/v2/beacon/blocks/<slot>
+func (c *ProdBeaconInstance) GetSlotBlock(slot uint64) (res *common.BeaconBlockMessage, err error) {
+	uri := fmt.Sprintf("%v/eth/v2/beacon/blocks/%v", c.beaconURI, slot)
+	resp := new(common.BeaconBlockResponse)
+	_, err = fetchBeacon(http.MethodGet, uri, nil, resp)
+	return &resp.Data.Message, err
 }

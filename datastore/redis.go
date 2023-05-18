@@ -3,51 +3,55 @@ package datastore
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math/big"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/flashbots/go-boost-utils/types"
-	"github.com/go-redis/redis/v9"
+	"github.com/attestantio/go-builder-client/api"
+	consensusspec "github.com/attestantio/go-eth2-client/spec"
+	"github.com/attestantio/go-eth2-client/spec/capella"
+	"github.com/bloXroute-Labs/mev-relay/common"
+	"github.com/redis/go-redis/extra/redisotel/v9"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
 	redisPrefix = "boost-relay"
 
-	expiryBidCache = 1 * time.Minute
+	expiryBidCache              = 1 * time.Minute
+	expiryBlockSubmissionStatus = 24 * time.Second
 
-	RedisConfigFieldPubkey    = "pubkey"
-	RedisStatsFieldLatestSlot = "latest-slot"
+	expiryActiveValidators = 3
 )
 
-func PubkeyHexToLowerStr(pk types.PubkeyHex) string {
-	return strings.ToLower(string(pk))
-}
+type BlockSimulationStatus string
 
-func connectRedis(redisURI string, connectionPoolLimit int) (*redis.Client, error) {
-	redisClient := redis.NewClient(&redis.Options{
-		PoolSize: connectionPoolLimit,
-		Addr:     redisURI,
-	})
-	if _, err := redisClient.Ping(context.Background()).Result(); err != nil {
-		// unable to connect to redis
-		return nil, err
-	}
-	return redisClient, nil
-}
+const (
+	BlockSimulationSubmitted = "1"
+	BlockSimulationPassed    = "2"
+	BlockSimulationFailed    = "3"
+)
 
-type RedisCache struct {
+type redisCache struct {
 	client *redis.Client
 
 	prefixGetHeaderResponse  string
 	prefixGetPayloadResponse string
 
+	prefixBlockSimulationStatus           string
+	prefixBlockBuilderLatestBids          string // latest bid for a given slot
+	prefixBlockBuilderLatestBidsValue     string // value of the latest bid for a given slot
+	prefixBlockBuilderLatestBidsValueTime string // value of the latest bid for a given slot
+	prefixBlockBuilderLatestBidsTime      string // when the request was received, to avoid older requests overwriting newer ones after a slot validation
+	prefixDeliveredPayload                string
+	prefixBlockBuilderSubmission          string
+	prefixBidTrace                        string
+
+	keyDemotedBuilders                string
 	keyKnownValidators                string
 	keyValidatorRegistration          string
+	prefixActiveValidators            string
+	prefixActiveValidatorsInt         string
 	keyValidatorRegistrationTimestamp string
 
 	keyRelayConfig    string
@@ -57,21 +61,43 @@ type RedisCache struct {
 	getHeaderList sync.Mutex
 }
 
-func NewRedisCache(redisURI, prefix string, connectionPoolLimit int) (*RedisCache, error) {
+func newRedisCache(redisURI, prefix string, connectionPoolLimit int) (*redisCache, error) {
 	client, err := connectRedis(redisURI, connectionPoolLimit)
 	if err != nil {
 		return nil, err
 	}
 
-	return &RedisCache{
+	// Enable tracing instrumentation.
+	if err := redisotel.InstrumentTracing(client); err != nil {
+		return nil, err
+	}
+
+	// Enable metrics instrumentation.
+	if err := redisotel.InstrumentMetrics(client); err != nil {
+		return nil, err
+	}
+
+	return &redisCache{
 		client: client,
 
 		prefixGetHeaderResponse:  fmt.Sprintf("%s/%s:cache-gethead-response", redisPrefix, prefix),
 		prefixGetPayloadResponse: fmt.Sprintf("%s/%s:cache-getpayload-response", redisPrefix, prefix),
 
+		prefixBlockSimulationStatus:           fmt.Sprintf("%s/%s:cache-block-simulation-status", redisPrefix, prefix),
+		prefixBlockBuilderLatestBids:          fmt.Sprintf("%s/%s:block-builder-latest-bid", redisPrefix, prefix),            // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixBlockBuilderLatestBidsValue:     fmt.Sprintf("%s/%s:block-builder-latest-bid-value", redisPrefix, prefix),      // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixBlockBuilderLatestBidsTime:      fmt.Sprintf("%s/%s:block-builder-latest-bid-time", redisPrefix, prefix),       // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixBlockBuilderLatestBidsValueTime: fmt.Sprintf("%s/%s:block-builder-latest-bid-value-time", redisPrefix, prefix), // hashmap for slot+parentHash+proposerPubkey with builderPubkey as field
+		prefixDeliveredPayload:                fmt.Sprintf("%s/%s:relay-delivered-payload", redisPrefix, prefix),
+		prefixBlockBuilderSubmission:          fmt.Sprintf("%s/%s:builder-block-submission", redisPrefix, prefix),
+		prefixBidTrace:                        fmt.Sprintf("%s/%s:bid-trace", redisPrefix, prefix),
+
+		keyDemotedBuilders:                fmt.Sprintf("%s/%s:builder-demoted", redisPrefix, prefix),
 		keyKnownValidators:                fmt.Sprintf("%s/%s:known-validators", redisPrefix, prefix),
 		keyValidatorRegistration:          fmt.Sprintf("%s/%s:validators-registration-timestamp", redisPrefix, prefix),
 		keyValidatorRegistrationTimestamp: fmt.Sprintf("%s/%s:validators-registration", redisPrefix, prefix),
+		prefixActiveValidators:            fmt.Sprintf("%s/%s:active-validators", redisPrefix, prefix),
+		prefixActiveValidatorsInt:         fmt.Sprintf("%s/%s:active-validators-int", redisPrefix, prefix),
 		keyRelayConfig:                    fmt.Sprintf("%s/%s:relay-config", redisPrefix, prefix),
 
 		keyStats:          fmt.Sprintf("%s/%s:stats", redisPrefix, prefix),
@@ -79,20 +105,24 @@ func NewRedisCache(redisURI, prefix string, connectionPoolLimit int) (*RedisCach
 	}, nil
 }
 
-func (r *RedisCache) keyCacheGetHeaderResponse(slot uint64, parentHash, proposerPubkey string) string {
-	return fmt.Sprintf("%s:%d_%s_%s", r.prefixGetHeaderResponse, slot, parentHash, proposerPubkey)
+func connectRedis(redisURI string, connectionPoolLimit int) (*redis.Client, error) {
+	redisClient := redis.NewClient(&redis.Options{
+		PoolSize:     connectionPoolLimit,
+		Addr:         redisURI,
+		MinIdleConns: connectionPoolLimit / 2,
+		PoolTimeout:  20 * time.Second,
+		ReadTimeout:  20 * time.Second,
+		WriteTimeout: 15 * time.Second,
+	})
+	if _, err := redisClient.Ping(context.Background()).Result(); err != nil {
+		// unable to connect to redis
+		return nil, err
+	}
+	return redisClient, nil
 }
 
-func (r *RedisCache) keyCacheGetHeaderResponseList(slot uint64, parentHash, proposerPubkey string) string {
-	return fmt.Sprintf("%s:%d_%s_%s_list", r.prefixGetHeaderResponse, slot, parentHash, proposerPubkey)
-}
-
-func (r *RedisCache) keyCacheGetPayloadResponse(slot uint64, blockHash string) string {
-	return fmt.Sprintf("%s:%d_%s", r.prefixGetPayloadResponse, slot, blockHash)
-}
-
-func (r *RedisCache) GetObj(key string, obj any) (err error) {
-	value, err := r.client.Get(context.Background(), key).Result()
+func (r *redisCache) getObj(ctx context.Context, key string, obj any) (err error) {
+	value, err := r.client.Get(ctx, key).Result()
 	if err != nil {
 		return err
 	}
@@ -100,247 +130,124 @@ func (r *RedisCache) GetObj(key string, obj any) (err error) {
 	return json.Unmarshal([]byte(value), &obj)
 }
 
-func (r *RedisCache) SetObj(key string, value any, expiration time.Duration) (err error) {
+func (r *redisCache) getObjSSZ(ctx context.Context, key string) (*common.GetPayloadResponse, error) {
+
+	res := new(common.GetPayloadResponse)
+	capData := new(capella.ExecutionPayload)
+
+	value, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	if err := capData.UnmarshalSSZ([]byte(value)); err != nil {
+		return nil, err
+	}
+
+	res.Capella = new(api.VersionedExecutionPayload)
+	res.Capella.Version = consensusspec.DataVersionCapella
+	res.Capella.Capella = capData
+
+	return res, nil
+}
+
+func (r *redisCache) getString(ctx context.Context, key string) (res string, err error) {
+	return r.client.Get(ctx, key).Result()
+}
+
+func (r *redisCache) setString(ctx context.Context, key string, value string, expiration time.Duration) (err error) {
+	return r.client.Set(ctx, key, value, expiration).Err()
+}
+
+func (r *redisCache) setObj(ctx context.Context, key string, value any, expiration time.Duration) (err error) {
 	marshalledValue, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 
-	return r.client.Set(context.Background(), key, marshalledValue, expiration).Err()
+	return r.client.Set(ctx, key, marshalledValue, expiration).Err()
 }
 
-func (r *RedisCache) GetKnownValidators() (map[types.PubkeyHex]uint64, error) {
-	validators := make(map[types.PubkeyHex]uint64)
-	entries, err := r.client.HGetAll(context.Background(), r.keyKnownValidators).Result()
-	if err != nil {
-		return nil, err
-	}
-	for pubkey, proposerIndexStr := range entries {
-		proposerIndex, err := strconv.ParseUint(proposerIndexStr, 10, 64)
-		if err == nil {
-			validators[types.PubkeyHex(pubkey)] = proposerIndex
-		}
-	}
-	return validators, nil
-}
-
-func (r *RedisCache) SetKnownValidator(pubkeyHex types.PubkeyHex, proposerIndex uint64) error {
-	return r.client.HSet(context.Background(), r.keyKnownValidators, PubkeyHexToLowerStr(pubkeyHex), proposerIndex).Err()
-}
-
-func (r *RedisCache) GetValidatorRegistration(proposerPubkey types.PubkeyHex) (*types.SignedValidatorRegistration, error) {
-	registration := new(types.SignedValidatorRegistration)
-	value, err := r.client.HGet(context.Background(), r.keyValidatorRegistration, strings.ToLower(proposerPubkey.String())).Result()
-	if errors.Is(err, redis.Nil) {
-		return nil, nil
-	} else if err != nil {
-		return nil, err
-	}
-
-	err = json.Unmarshal([]byte(value), registration)
-	return registration, err
-}
-
-func (r *RedisCache) GetValidatorRegistrationTimestamp(proposerPubkey types.PubkeyHex) (uint64, error) {
-	timestamp, err := r.client.HGet(context.Background(), r.keyValidatorRegistrationTimestamp, strings.ToLower(proposerPubkey.String())).Uint64()
-	if errors.Is(err, redis.Nil) {
-		return 0, nil
-	}
-	return timestamp, err
-}
-
-func (r *RedisCache) SetValidatorRegistration(entry types.SignedValidatorRegistration) error {
-	err := r.client.HSet(context.Background(), r.keyValidatorRegistrationTimestamp, strings.ToLower(entry.Message.Pubkey.PubkeyHex().String()), entry.Message.Timestamp).Err()
+// setObjTx is a transactional version of setObj
+func setObjTx(ctx context.Context, tx redis.Pipeliner, key string, value any, expiration time.Duration) (err error) {
+	marshalledValue, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
 
-	marshalledValue, err := json.Marshal(entry)
+	return tx.Set(ctx, key, marshalledValue, expiration).Err()
+}
+
+// setObjTx is a transactional version of setObj
+func setObjTxWithReturn(ctx context.Context, tx redis.Pipeliner, key string, value any, expiration time.Duration) (strVal string, err error) {
+	marshalledValue, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+
+	return string(marshalledValue), tx.Set(ctx, key, marshalledValue, expiration).Err()
+}
+
+// setObjTxSSZ is a transactional version of setObj
+func setObjTxSSZ(ctx context.Context, tx redis.Pipeliner, key string, value *common.GetPayloadResponse, expiration time.Duration) (err error) {
+	b, err := value.Capella.Capella.MarshalSSZ()
 	if err != nil {
 		return err
 	}
 
-	err = r.client.HSet(context.Background(), r.keyValidatorRegistration, strings.ToLower(entry.Message.Pubkey.PubkeyHex().String()), marshalledValue).Err()
-	return err
+	return tx.Set(ctx, key, b, expiration).Err()
 }
 
-type AliasSignedValidatorRegistration types.SignedValidatorRegistration
-
-func (i AliasSignedValidatorRegistration) MarshalBinary() ([]byte, error) {
-	return json.Marshal(i)
-}
-
-func (r *RedisCache) SetValidatorRegistrationMap(data map[string]interface{}) error {
-	return r.client.HSet(context.Background(), r.keyValidatorRegistration, data).Err()
-}
-
-func (r *RedisCache) SetValidatorRegistrations(entries []types.SignedValidatorRegistration) error {
-	for _, entry := range entries {
-		err := r.SetValidatorRegistration(entry)
-		if err != nil {
-			return err
-		}
+// hSetObjTx is a transactional version of hSetObj
+func hSetObjTx(ctx context.Context, tx redis.Pipeliner, key, field string, value any, expiration time.Duration) error {
+	marshalledValue, err := json.Marshal(value)
+	if err != nil {
+		return err
 	}
+
+	err = tx.HSet(ctx, key, field, marshalledValue).Err()
+	if err != nil {
+		return err
+	}
+
+	return tx.Expire(ctx, key, expiration).Err()
+}
+
+// hSetObjTxNoExpire is a transactional version of hSetObj without calling expire
+func hSetObjTxNoExpire(ctx context.Context, tx redis.Pipeliner, key, field string, value any, expiration time.Duration) error {
+	marshalledValue, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+
+	err = tx.HSet(ctx, key, field, marshalledValue).Err()
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func (r *RedisCache) NumRegisteredValidators() (int64, error) {
-	return r.client.HLen(context.Background(), r.keyValidatorRegistrationTimestamp).Result()
-}
+func (r *redisCache) UpdateActiveValidatorCount(ctx context.Context) error {
 
-func (r *RedisCache) SetStats(field string, value any) (err error) {
-	return r.client.HSet(context.Background(), r.keyStats, field, value).Err()
-}
-
-func (r *RedisCache) GetStats(field string) (value string, err error) {
-	return r.client.HGet(context.Background(), r.keyStats, field).Result()
-}
-
-func (r *RedisCache) SetProposerDuties(proposerDuties []types.BuilderGetValidatorsResponseEntry) (err error) {
-	return r.SetObj(r.keyProposerDuties, proposerDuties, 0)
-}
-
-func (r *RedisCache) GetProposerDuties() (proposerDuties []types.BuilderGetValidatorsResponseEntry, err error) {
-	proposerDuties = make([]types.BuilderGetValidatorsResponseEntry, 0)
-	err = r.GetObj(r.keyProposerDuties, &proposerDuties)
-	if errors.Is(err, redis.Nil) {
-		return proposerDuties, nil
-	}
-	return proposerDuties, err
-}
-
-func (r *RedisCache) SetRelayConfig(field, value string) (err error) {
-	return r.client.HSet(context.Background(), r.keyRelayConfig, field, value).Err()
-}
-
-func (r *RedisCache) GetRelayConfig(field string) (string, error) {
-	res, err := r.client.HGet(context.Background(), r.keyRelayConfig, field).Result()
-	if errors.Is(err, redis.Nil) {
-		return res, nil
-	}
-	return res, err
-}
-
-func (r *RedisCache) SaveGetHeaderResponse(slot uint64, parentHash, proposerPubkey string, headerResp *types.GetHeaderResponse) (err error) {
-	key := r.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
-	return r.SetObj(key, headerResp, expiryBidCache)
-}
-
-func (r *RedisCache) SaveGetHeaderResponseInList(slot uint64, parentHash, proposerPubkey string, headerResp *types.GetHeaderResponse) error {
-	key := r.keyCacheGetHeaderResponseList(slot, parentHash, proposerPubkey)
-	bids := []types.GetHeaderResponse{}
-	r.getHeaderList.Lock()
-	err := r.GetObj(key, &bids)
-	r.getHeaderList.Unlock()
+	registration, err := r.client.HGetAll(ctx, r.keyValidatorRegistration).Result()
 	if err != nil && err != redis.Nil {
 		return err
 	}
-	bids = append(bids, *headerResp)
-	r.getHeaderList.Lock()
-	err = r.SetObj(key, bids, expiryBidCache)
-	r.getHeaderList.Unlock()
-	return err
-}
 
-func (r *RedisCache) DeleteBlockSubmission(slot uint64, parentHash, proposerPubkey, blockHash string) (types.GetHeaderResponse, error) {
-	maxBid := types.GetHeaderResponse{}
+	total := 0
 
-	key := r.keyCacheGetHeaderResponseList(slot, parentHash, proposerPubkey)
-	bids := []types.GetHeaderResponse{}
-	r.getHeaderList.Lock()
-	err := r.GetObj(key, &bids)
-	r.getHeaderList.Unlock()
-	if err != nil {
-		return maxBid, err
-	}
-
-	maxBidValue := big.NewInt(0)
-	newBidList := []types.GetHeaderResponse{}
-	for _, bid := range bids {
-		if strings.EqualFold(bid.Data.Message.Header.BlockHash.String(), blockHash) {
-			continue
+	threeHoursAgo := time.Now().Add(-3 * time.Hour).UnixNano()
+	for _, regString := range registration {
+		reg := new(ValidatorLatency)
+		if err := json.Unmarshal([]byte(regString), reg); err != nil {
+			return err
 		}
-		newBidList = append(newBidList, bid)
-		if maxBidValue.Cmp(bid.Data.Message.Value.BigInt()) < 0 {
-			maxBidValue = bid.Data.Message.Value.BigInt()
-			maxBid = bid
+
+		if reg.LastRegistered > threeHoursAgo {
+			total += 1
 		}
 	}
 
-	if maxBid.Data == nil {
-		return maxBid, errors.New("max SignedBuilderBid is nil")
-	}
-
-	if err := r.SaveGetHeaderResponse(slot, parentHash, proposerPubkey, &maxBid); err != nil {
-		return maxBid, err
-	}
-
-	r.getHeaderList.Lock()
-	err = r.SetObj(key, newBidList, expiryBidCache)
-	r.getHeaderList.Unlock()
-	return maxBid, err
-}
-
-func (r *RedisCache) DeleteBlockSubmissions(slot uint64, parentHash, proposerPubkey string, blockHash map[string]bool) (types.GetHeaderResponse, error) {
-	maxBid := types.GetHeaderResponse{}
-
-	key := r.keyCacheGetHeaderResponseList(slot, parentHash, proposerPubkey)
-	bids := []types.GetHeaderResponse{}
-	r.getHeaderList.Lock()
-	err := r.GetObj(key, &bids)
-	r.getHeaderList.Unlock()
-	if err != nil {
-		return maxBid, err
-	}
-
-	newBidList := []types.GetHeaderResponse{}
-	maxBidValue := big.NewInt(0)
-	for _, bid := range bids {
-		if _, ok := blockHash[strings.ToLower(bid.Data.Message.Header.BlockHash.String())]; ok {
-			continue
-		}
-		newBidList = append(newBidList, bid)
-		if maxBidValue.Cmp(bid.Data.Message.Value.BigInt()) < 0 {
-			maxBidValue = bid.Data.Message.Value.BigInt()
-			maxBid = bid
-		}
-	}
-
-	if maxBid.Data == nil {
-		return maxBid, errors.New("max SignedBuilderBid is nil")
-	}
-
-	if err := r.SaveGetHeaderResponse(slot, parentHash, proposerPubkey, &maxBid); err != nil {
-		return maxBid, err
-	}
-
-	r.getHeaderList.Lock()
-	err = r.SetObj(key, newBidList, expiryBidCache)
-	r.getHeaderList.Unlock()
-	return maxBid, err
-}
-
-func (r *RedisCache) GetGetHeaderResponse(slot uint64, parentHash, proposerPubkey string) (*types.GetHeaderResponse, error) {
-	key := r.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
-	resp := new(types.GetHeaderResponse)
-	err := r.GetObj(key, resp)
-	if errors.Is(err, redis.Nil) {
-		return nil, nil
-	}
-	return resp, err
-}
-
-func (r *RedisCache) SaveGetPayloadResponse(slot uint64, proposerPubkey string, resp *types.GetPayloadResponse) (err error) {
-	key := r.keyCacheGetPayloadResponse(slot, resp.Data.BlockHash.String())
-	return r.SetObj(key, resp, expiryBidCache)
-}
-
-func (r *RedisCache) GetGetPayloadResponse(slot uint64, blockHash string) (*types.GetPayloadResponse, error) {
-	key := r.keyCacheGetPayloadResponse(slot, blockHash)
-	resp := new(types.GetPayloadResponse)
-	err := r.GetObj(key, resp)
-	if errors.Is(err, redis.Nil) {
-		return nil, nil
-	}
-	return resp, err
+	return r.client.Set(ctx, r.prefixActiveValidatorsInt, total, 2*time.Hour).Err()
 }
