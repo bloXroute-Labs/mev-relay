@@ -218,7 +218,7 @@ func timeValueToUnixms(value string) (int64, error) {
 func timeValueToValue(value string) (*big.Int, error) {
 	splitValues := strings.Split(value, ",")
 	if len(splitValues) != 2 {
-		return nil, errors.New("could not get value from string")
+		return nil, nil
 	}
 
 	b, ok := big.NewInt(0).SetString(splitValues[0], 10)
