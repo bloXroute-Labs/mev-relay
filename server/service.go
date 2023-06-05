@@ -198,6 +198,7 @@ type BoostServiceOpts struct {
 	TopBlockLimit               int
 	ExternalRelaysForComparison []string
 	GetPayloadRequestCutoffMs   int
+	GetHeaderRequestCutoffMs    int
 	CapellaForkEpoch            int64
 	EnableBidSaveCancellation   bool
 	Tracer                      trace.Tracer
@@ -305,6 +306,7 @@ type BoostService struct {
 	topBlockMap *syncmap.SyncMap[uint64, *syncmap.SyncMap[string, int]]
 
 	getPayloadRequestCutoffMs int
+	getHeaderRequestCutoffMs  int
 
 	performanceStats PerformanceStats
 
@@ -434,7 +436,9 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 
 		topBlockMap: syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, int]](),
 
-		getPayloadRequestCutoffMs:   opts.GetPayloadRequestCutoffMs,
+		getPayloadRequestCutoffMs: opts.GetPayloadRequestCutoffMs,
+		getHeaderRequestCutoffMs:  opts.GetHeaderRequestCutoffMs,
+
 		externalRelaysForComparison: opts.ExternalRelaysForComparison,
 
 		beaconClient:                   *beaconclient.NewMultiBeaconClient(opts.Log, beaconInstances),
@@ -894,6 +898,15 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 		return
 	}
 
+	slotStartTimestamp := m.genesisInfo.Data.GenesisTime + (slot * 12)
+	msIntoSlot := start.UnixMilli() - int64(slotStartTimestamp*1000)
+
+	if m.getHeaderRequestCutoffMs > 0 && msIntoSlot > int64(m.getHeaderRequestCutoffMs) {
+		log.Info("too late into slot")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if len(pubkey) != 98 {
 		m.respondErrorWithLog(w, http.StatusBadRequest, errInvalidPubkey.Error(), log, fmt.Sprintf("pub key should be %d long", 98))
 		return
@@ -911,8 +924,6 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 	}
 
 	highestRankedRelay := new(string)
-	slotStartTimestamp := m.genesisInfo.Data.GenesisTime + (slot * 12)
-	msIntoSlot := start.UnixMilli() - int64(slotStartTimestamp*1000)
 
 	fetchGetHeaderStartTime := time.Now().UTC()
 	slotBestHeaderRaw, slotBestHeader, dataSource, err := m.datastore.GetGetHeaderResponse(spanContext, slot, parentHashHex, pubkey)

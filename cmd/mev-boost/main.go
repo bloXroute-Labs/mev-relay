@@ -95,6 +95,7 @@ var (
 	topBlockLimit                = flag.Int("top-block-limit", 3, "number of top blocks to save per slot")
 	externalRelaysForComparison  = flag.String("external-relays-for-comparison", "", "")
 	getPayloadRequestCutoff      = flag.Int("getpayload-request-cutoff", 4000, "getPayload request cutoff time in ms")
+	getHeaderRequestCutoff       = flag.Int("getheader-request-cutoff", 3000, "getHeader request cutoff time in ms")
 	enableBidSaveCancellation    = flag.Bool("enable-bid-save-cancellation", false, "enables cancellation of saving bids due to later blocks received from the same builder")
 
 	uptraceDSN = flag.String("uptrace-dsn", "", "url for uptrace dsn")
@@ -304,6 +305,7 @@ func main() {
 		TopBlockLimit:               *topBlockLimit,
 		ExternalRelaysForComparison: parseExternalRelaysForComparisonURLs(*externalRelaysForComparison),
 		GetPayloadRequestCutoffMs:   *getPayloadRequestCutoff,
+		GetHeaderRequestCutoffMs:    *getHeaderRequestCutoff,
 		CapellaForkEpoch:            *capellaForkEpoch,
 
 		Tracer: tracer,
