@@ -180,7 +180,7 @@ func TestNewBoostServiceErrors(t *testing.T) {
 			types.PublicKey{}, "", url.URL{}, url.URL{}, url.URL{},
 			"", false, "", testHighPriorityBuilderPubkeys, testHighPerfSimBuilderPubkeys,
 			&database.MockDB{}, "", "", "", "", "", "", "",
-			"", false, RelayMaxProfit, 80, 0, []string{}, 0, 0, false, trace.NewNoopTracerProvider().Tracer("test")})
+			"", false, RelayMaxProfit, 80, 0, []string{}, 0, 0, 0, false, trace.NewNoopTracerProvider().Tracer("test")})
 		require.Error(t, err)
 	})
 }
