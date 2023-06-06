@@ -948,16 +948,6 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 		"bid-pubkey":                slotBestHeader.Capella.Capella.Message.Pubkey.String(),
 	})
 
-	checkGetPayloadStartTime := time.Now().UTC()
-	getPayloadResponse, err := m.datastore.CheckGetPayloadResponse(spanContext, slot, slotBestHeader.Capella.Capella.Message.Header.BlockHash.String())
-	payload := getPayloadResponse.Capella
-	if payload == nil || payload.Capella == nil || err != nil {
-		log.Errorf("no payload in redis for the best available header for slot: %v, parent hash: %v, proposer public key: %v, error: %v", slot, parentHashHex, pubkey, err)
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
-	checkGetPayloadDurationMS := time.Since(checkGetPayloadStartTime).Milliseconds()
-
 	go func() {
 		ranking, ok := m.relayRankings.Load(*highestRankedRelay)
 		if !ok {
@@ -1031,17 +1021,15 @@ func (m *BoostService) handleGetHeader(w http.ResponseWriter, req *http.Request)
 	responseSendTime := time.Now().UTC()
 
 	log.WithFields(logrus.Fields{
-		"requestStartTime":          start.String(),
-		"responseSendTime":          responseSendTime.String(),
-		"durationUntilResponseMS":   responseSendTime.Sub(start).Milliseconds(),
-		"fetchGetHeaderStartTime":   fetchGetHeaderStartTime.String(),
-		"fetchGetHeaderDurationMS":  fetchGetHeaderDurationMS,
-		"fetchGetHeaderDataSource":  dataSource,
-		"checkGetPayloadStartTime":  checkGetPayloadStartTime.String(),
-		"checkGetPayloadDurationMS": checkGetPayloadDurationMS,
-		"blockHash":                 slotBestHeader.Capella.Capella.Message.Header.BlockHash.String(),
-		"slotStartSec":              slotStartTimestamp,
-		"msIntoSlot":                msIntoSlot,
+		"requestStartTime":         start.String(),
+		"responseSendTime":         responseSendTime.String(),
+		"durationUntilResponseMS":  responseSendTime.Sub(start).Milliseconds(),
+		"fetchGetHeaderStartTime":  fetchGetHeaderStartTime.String(),
+		"fetchGetHeaderDurationMS": fetchGetHeaderDurationMS,
+		"fetchGetHeaderDataSource": dataSource,
+		"blockHash":                slotBestHeader.Capella.Capella.Message.Header.BlockHash.String(),
+		"slotStartSec":             slotStartTimestamp,
+		"msIntoSlot":               msIntoSlot,
 	}).Info("returning stored header")
 
 	success = true
