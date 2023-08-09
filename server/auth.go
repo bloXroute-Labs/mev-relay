@@ -18,6 +18,8 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"github.com/patrickmn/go-cache"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
 )
 
 const (
@@ -300,4 +302,55 @@ func respondError(log *logrus.Entry, w http.ResponseWriter, code int, message st
 		log.WithField("response", resp).WithError(err).Error("couldn't write error response")
 		http.Error(w, "", http.StatusInternalServerError)
 	}
+}
+
+func (a Auth) rpcAuthentication(ctx context.Context) (context.Context, error) {
+
+	p, _ := peer.FromContext(ctx)
+	clientIPAddress := p.Addr.String()
+
+	whitelistIP := strings.Contains(a.builderIPs, strings.Split(clientIPAddress, ":")[0]) || strings.Contains(a.builderIPs, clientIPAddress)
+	if whitelistIP {
+		return ctx, nil
+	}
+
+	auth, err := ReadAuthMetadata(ctx)
+	if err != nil {
+		return ctx, err
+	}
+
+	var builderAccount sdnmessage.Account
+
+	accountID, secret, err := a.parseAuthHeader(auth)
+	if err != nil {
+		a.log.Info("failed to parse RPC Auth Header")
+		return ctx, err
+	}
+
+	account, found := a.cacheIDToAccountInfo.Get(accountID)
+	if found {
+		builderAccount = account.(sdnmessage.Account)
+	} else {
+		builderAccount, err = a.processAccountRequest(accountID, secret)
+		if err != nil {
+			return ctx, err
+		}
+	}
+
+	return context.WithValue(ctx, authInfoKey,
+		newAuthInfo(headerAuth).addAccountID(accountID).addAccountTier(builderAccount.TierName)), nil
+}
+
+// ReadAuthMetadata reads auth info from the RPC connection context
+func ReadAuthMetadata(ctx context.Context) (string, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return "", errors.New("could not read metadata from context")
+	}
+
+	values := md.Get("authorization")
+	if len(values) == 0 {
+		return "", errors.New("no auth information was provided")
+	}
+	return values[0], nil
 }
