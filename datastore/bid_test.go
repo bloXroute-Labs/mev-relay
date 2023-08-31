@@ -9,17 +9,23 @@ import (
 	"time"
 
 	"github.com/attestantio/go-builder-client/api/capella"
+	v1 "github.com/attestantio/go-builder-client/api/v1"
 	"github.com/attestantio/go-builder-client/spec"
 	consensusspec "github.com/attestantio/go-eth2-client/spec"
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/bloXroute-Labs/gateway/v2/sdnmessage"
+	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
 	"github.com/bloXroute-Labs/mev-relay/common"
+	"github.com/flashbots/go-boost-utils/types"
 	"github.com/holiman/uint256"
 	"github.com/redis/go-redis/v9"
 	uuid "github.com/satori/go.uuid"
 	"github.com/stretchr/testify/assert"
 
 	capellaspec "github.com/attestantio/go-eth2-client/spec/capella"
+
+	ethcommon "github.com/ethereum/go-ethereum/common"
 )
 
 const (
@@ -153,4 +159,101 @@ func TestUnmarshalRedisCapellaBlockMessage(t *testing.T) {
 	assert.Equal(t, testBlockHashString, result.Payload.Message.BlockHash.String())
 	assert.Equal(t, testBuilderPubKeyString, result.Payload.Message.BuilderPubkey.String())
 	assert.Equal(t, testValueString, result.Payload.Message.Value.ToBig().String())
+}
+
+func fakeSaveBlockData(value uint64, builderPubkey, proposerPubkey types.PublicKey, parentHash ethcommon.Hash) (*common.GetHeaderResponse, *capellaspec.ExecutionPayload, *v1.BidTrace) {
+
+	blockHash := common.GenerateRandomEthHash()
+
+	getHeaderResponseOne := common.GetHeaderResponse{
+		Capella: &spec.VersionedSignedBuilderBid{
+			Version: consensusspec.DataVersionCapella,
+			Capella: &capella.SignedBuilderBid{
+				Message: &capella.BuilderBid{
+					Value: uint256.NewInt(value),
+					Header: &capellaspec.ExecutionPayloadHeader{
+						BlockHash:    phase0.Hash32(blockHash),
+						ParentHash:   phase0.Hash32(parentHash),
+						FeeRecipient: bellatrix.ExecutionAddress{},
+						StateRoot:    [32]byte{0x1},
+						ReceiptsRoot: [32]byte{0x1},
+						LogsBloom:    [256]byte{0x1},
+					},
+					Pubkey: phase0.BLSPubKey(builderPubkey),
+				},
+				Signature: phase0.BLSSignature{},
+			},
+		},
+	}
+	payloadOne := capellaspec.ExecutionPayload{
+		BlockHash:  phase0.Hash32(blockHash),
+		ParentHash: phase0.Hash32(parentHash),
+	}
+	bidTrace := v1.BidTrace{
+		Slot:           1,
+		BlockHash:      phase0.Hash32(blockHash),
+		ParentHash:     phase0.Hash32(parentHash),
+		Value:          uint256.NewInt(value),
+		ProposerPubkey: phase0.BLSPubKey(proposerPubkey),
+		BuilderPubkey:  phase0.BLSPubKey(builderPubkey),
+	}
+	return &getHeaderResponseOne, &payloadOne, &bidTrace
+}
+
+func TestTopBlockReplacement(t *testing.T) {
+	ds := setupTestDatastore(t)
+
+	proposerPubkey := common.GenerateRandomPublicKey()
+	builderOne := common.GenerateRandomPublicKey()
+	builderTwo := common.GenerateRandomPublicKey()
+	parentHash := common.GenerateRandomEthHash()
+
+	fakeChan := make(chan *syncmap.SyncMap[uint64, []string])
+	getHeaderResponseOne, payloadOne, bidTracOne := fakeSaveBlockData(100, builderOne, proposerPubkey, parentHash)
+	isMostProfitableOne, _, err := ds.SaveBlock(context.Background(), getHeaderResponseOne, payloadOne, bidTracOne, time.Now(), fakeChan, sdnmessage.ATierUltra)
+
+	assert.NoError(t, err)
+	assert.False(t, isMostProfitableOne) // no top bid at point in time
+
+	getHeaderResponseTwo, payloadTwo, bidTraceTwo := fakeSaveBlockData(105, builderTwo, proposerPubkey, parentHash)
+	isMostProfitableTwo, _, err := ds.SaveBlock(context.Background(), getHeaderResponseTwo, payloadTwo, bidTraceTwo, time.Now(), fakeChan, sdnmessage.ATierUltra)
+
+	assert.NoError(t, err)
+	assert.True(t, isMostProfitableTwo) // this is the top bid
+}
+
+func TestBlockCancellation(t *testing.T) {
+	ds := setupTestDatastore(t)
+
+	proposerPubkey := common.GenerateRandomPublicKey()
+	builderOne := common.GenerateRandomPublicKey()
+	builderTwo := common.GenerateRandomPublicKey()
+	parentHash := common.GenerateRandomEthHash()
+
+	fakeChan := make(chan *syncmap.SyncMap[uint64, []string])
+	getHeaderResponseOne, payloadOne, bidTracOne := fakeSaveBlockData(100, builderOne, proposerPubkey, parentHash)
+	isMostProfitableOne, _, err := ds.SaveBlock(context.Background(), getHeaderResponseOne, payloadOne, bidTracOne, time.Now(), fakeChan, sdnmessage.ATierUltra)
+
+	assert.NoError(t, err)
+	assert.False(t, isMostProfitableOne)
+
+	getHeaderResponseTwo, payloadTwo, bidTraceTwo := fakeSaveBlockData(90, builderTwo, proposerPubkey, parentHash)
+	isMostProfitableTwo, _, err := ds.SaveBlock(context.Background(), getHeaderResponseTwo, payloadTwo, bidTraceTwo, time.Now(), fakeChan, sdnmessage.ATierUltra)
+
+	assert.NoError(t, err)
+	assert.False(t, isMostProfitableTwo)
+
+	getHeaderResponseThree, payloadThree, bidTraceThree := fakeSaveBlockData(80, builderOne, proposerPubkey, parentHash)
+	isMostProfitableThree, _, err := ds.SaveBlock(context.Background(), getHeaderResponseThree, payloadThree, bidTraceThree, time.Now(), fakeChan, sdnmessage.ATierUltra)
+
+	assert.NoError(t, err)
+	assert.False(t, isMostProfitableThree)
+
+	keyTopBid := ds.redis.keyCacheGetHeaderResponse(1, parentHash.String(), proposerPubkey.String())
+	topBid, err := ds.redis.client.Get(context.Background(), keyTopBid).Result()
+	assert.NoError(t, err)
+	bidTwo, err := getHeaderResponseTwo.MarshalJSON()
+	assert.NoError(t, err)
+	assert.Equal(t, topBid, string(bidTwo))
+
 }

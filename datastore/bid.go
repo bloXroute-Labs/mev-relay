@@ -369,10 +369,6 @@ func (ds *Datastore) UpdateTopBidTx(ctx context.Context, tx redis.Pipeliner, slo
 
 			val := new(big.Int)
 			val.SetString(bidValue, 10)
-			// if there is a bid with higher value, no need to update top bid
-			if val.Cmp(newBidValue) > 0 {
-				return false, nil
-			}
 			if val.Cmp(topBidValue) > 0 {
 				topBidValue = val
 				topBidBuilderPubkey = builderPubkey
@@ -383,17 +379,19 @@ func (ds *Datastore) UpdateTopBidTx(ctx context.Context, tx redis.Pipeliner, slo
 			return false, ErrFailedUpdatingTopBidNoBids
 		}
 
-		keyTopBid := ds.redis.keyCacheGetHeaderResponse(slot, parentHash, proposerPubkey)
-		currentTopBidCmd := tx.Get(ctx, keyTopBid)
-		_, err = tx.Exec(ctx)
-		if err != nil && !errors.Is(err, redis.Nil) {
+		keyLatestBid := ds.redis.keyBlockBuilderLatestBid(slot, parentHash, proposerPubkey, topBidBuilderPubkey)
+
+		topBuilderLatestBidCMD := tx.Get(ctx, keyLatestBid)
+		if _, err := tx.Exec(ctx); err != nil {
 			return false, err
 		}
-		val, err := currentTopBidCmd.Result()
+
+		topBuilderLatestBid, err := topBuilderLatestBidCMD.Result()
 		if err != nil {
 			return false, err
 		}
-		newTopBidStr = val
+
+		newTopBidStr = topBuilderLatestBid
 	}
 
 	if newTopBidStr == "" {
