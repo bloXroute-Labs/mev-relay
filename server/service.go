@@ -349,6 +349,8 @@ type BoostService struct {
 	keysToExpireChan chan *syncmap.SyncMap[uint64, []string]
 
 	tracer trace.Tracer
+
+	auth Auth
 }
 
 type deliveredPayloadsResult struct {
@@ -581,6 +583,7 @@ func (m *BoostService) respondEncodedJSON(w http.ResponseWriter, response []byte
 
 func (m *BoostService) getRouter() http.Handler {
 	auth := NewAuth(m.log, m.certificatesPath, m.sdnURL, m.builderIPs)
+	m.auth = auth
 
 	r := mux.NewRouter()
 
