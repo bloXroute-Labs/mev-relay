@@ -109,7 +109,8 @@ var (
 	useGenesisForkVersionSepolia = flag.Bool("sepolia", false, "use Sepolia genesis fork version 0x90000069 (for signature validation)")
 	useCustomGenesisForkVersion  = flag.String("genesis-fork-version", defaultGenesisForkVersion, "use a custom genesis fork version (for signature validation)")
 
-	updateActiveValidators = flag.Bool("update-active-validators", false, "if this relay should manage updating active validators")
+	updateActiveValidators       = flag.Bool("update-active-validators", false, "if this relay should manage updating active validators")
+	trustedValidatorBearerTokens = flag.String("trusted-validator-bearer-tokens", "", "comma separated list of trusted validator bearer tokens")
 )
 
 var log = logrus.WithField("module", "cmd/mev-boost")
@@ -267,6 +268,14 @@ func main() {
 		}
 	}
 
+	trustedValidatorBearerTokensMap := syncmap.NewStringMapOf[struct{}]()
+	if *trustedValidatorBearerTokens != "" {
+		trustedValidatorBearerTokensSlice := strings.Split(*trustedValidatorBearerTokens, ",")
+		for _, token := range trustedValidatorBearerTokensSlice {
+			trustedValidatorBearerTokensMap.Store(strings.ToLower(token), struct{}{})
+		}
+	}
+
 	opts := server.BoostServiceOpts{
 		Log:                         log,
 		ListenAddr:                  *listenAddr,
@@ -307,6 +316,8 @@ func main() {
 		GetPayloadRequestCutoffMs:   *getPayloadRequestCutoff,
 		GetHeaderRequestCutoffMs:    *getHeaderRequestCutoff,
 		CapellaForkEpoch:            *capellaForkEpoch,
+
+		TrustedValidatorBearerTokens: trustedValidatorBearerTokensMap,
 
 		Tracer: tracer,
 	}

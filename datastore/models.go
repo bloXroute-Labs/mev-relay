@@ -17,6 +17,7 @@ type ValidatorLatency struct {
 	IPAddress      string                            `json:"ip_address"`
 	LastRegistered int64                             `json:"last_registered"`
 	Latency        float32                           `json:"latency"`
+	IsTrusted      bool                              `json:"is_trusted"`
 }
 
 func (l *ValidatorLatency) MarshalBinary() ([]byte, error) {

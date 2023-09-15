@@ -131,3 +131,29 @@ func (ds *Datastore) GetValidatorRegistration(ctx context.Context, proposerPubke
 	fmt.Printf("stuff: %+v", registration)
 	return &registration.Registration, err
 }
+
+// IsValidatorTrusted returns the validator is trusted or not for the given proposerPubkey.
+func (ds *Datastore) IsValidatorTrusted(ctx context.Context, proposerPubkey types.PubkeyHex) bool {
+	value, err := ds.redis.client.HGet(ctx, ds.redis.keyValidatorRegistration, strings.ToLower(proposerPubkey.String())).Result()
+	if errors.Is(err, redis.Nil) {
+		ds.log.WithError(err).
+			WithField("proposerPubKey", proposerPubkey).
+			Error("validator registration not found")
+		return false
+	}
+	if err != nil {
+		ds.log.WithError(err).
+			WithField("proposerPubKey", proposerPubkey).
+			Error(err.Error())
+		return false
+	}
+
+	registration := new(ValidatorLatency)
+	if err = json.Unmarshal([]byte(value), registration); err != nil {
+		ds.log.WithError(err).
+			WithField("proposerPubKey", proposerPubkey).
+			Error(err.Error())
+		return false
+	}
+	return registration != nil && registration.IsTrusted
+}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math/big"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
@@ -24,8 +25,35 @@ const (
 		}
 	*/
 	highPriorityBuilderDataConfigFile = "config_files/high_priority_builder_data.json"
+	trustedValidatorDataConfigFile    = "config_files/trusted_validator_data.json"
 	weiToEthMultiplier                = 1e18
 )
+
+type TrustedValidatorData struct {
+	TrustedValidatorBearerTokens map[string]struct{} `json:"trusted_validator_bearer_tokens"`
+}
+
+// loadTrustedValidatorData loads trusted validator data from config file
+func (m *BoostService) loadTrustedValidatorData() {
+	f, err := os.Open(trustedValidatorDataConfigFile)
+	if err != nil {
+		m.log.Errorf("could not load trusted validator data, %v", err)
+		return
+	}
+
+	var trustedValidatorData TrustedValidatorData
+	if err := json.NewDecoder(f).Decode(&trustedValidatorData); err != nil {
+		m.log.Errorf("could not load trusted validator data, %v", err)
+		return
+	}
+
+	// move trusted validator bearer tokens from config to existing map
+	for k, v := range trustedValidatorData.TrustedValidatorBearerTokens {
+		m.trustedValidatorBearerTokens.Store(strings.ToLower(k), v)
+	}
+
+	m.log.WithField("TrustedValidatorBearerTokenSize", m.trustedValidatorBearerTokens.Size()).Info("trusted validator data successfully loaded")
+}
 
 type HighPriorityBuilderData struct {
 	Pubkeys                             map[string]bool    `json:"high_priority_builder_pubkeys"`
