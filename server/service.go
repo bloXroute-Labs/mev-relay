@@ -70,6 +70,8 @@ const (
 
 	blockSubmissionChannel = "blockSubmission"
 	redisPubsubChannelSize = 1000
+
+	AuthHeaderPrefix = "bearer "
 )
 
 // RPCRequestType represents the JSON-RPC methods that are callable
@@ -202,6 +204,8 @@ type BoostServiceOpts struct {
 	CapellaForkEpoch            int64
 	EnableBidSaveCancellation   bool
 	Tracer                      trace.Tracer
+
+	TrustedValidatorBearerTokens *syncmap.SyncMap[string, struct{}]
 }
 
 type ProvidedHeaders struct {
@@ -345,8 +349,9 @@ type BoostService struct {
 	nodeUUID                        uuid.UUID
 	enableBidSaveCancellation       bool
 
-	slotKeysToExpire *syncmap.SyncMap[uint64, *syncmap.SyncMap[string, bool]]
-	keysToExpireChan chan *syncmap.SyncMap[uint64, []string]
+	slotKeysToExpire             *syncmap.SyncMap[uint64, *syncmap.SyncMap[string, bool]]
+	keysToExpireChan             chan *syncmap.SyncMap[uint64, []string]
+	trustedValidatorBearerTokens *syncmap.SyncMap[string, struct{}]
 
 	tracer trace.Tracer
 
@@ -496,8 +501,9 @@ func NewBoostService(opts BoostServiceOpts) (*BoostService, error) {
 		builderContextsForSlot:          syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, *builderContextData]](),
 		enableBidSaveCancellation:       opts.EnableBidSaveCancellation,
 
-		slotKeysToExpire: syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, bool]](),
-		keysToExpireChan: make(chan *syncmap.SyncMap[uint64, []string]),
+		slotKeysToExpire:             syncmap.NewIntegerMapOf[uint64, *syncmap.SyncMap[string, bool]](),
+		keysToExpireChan:             make(chan *syncmap.SyncMap[uint64, []string]),
+		trustedValidatorBearerTokens: opts.TrustedValidatorBearerTokens,
 
 		tracer: opts.Tracer,
 	}
@@ -762,16 +768,29 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 		"method": "registerValidator",
 	})
 
+	var (
+		isTrustedValidator bool
+	)
+	authHeader := strings.ToLower(req.Header.Get("authorization"))
+	if strings.HasPrefix(authHeader, AuthHeaderPrefix) {
+		token := strings.TrimPrefix(authHeader, AuthHeaderPrefix)
+		isTrustedValidator = m.trustedValidatorBearerTokens.Has(token)
+	}
+
 	var registrations []types.SignedValidatorRegistration
 	if err := decodeJSONAndClose(req.Body, &registrations); err != nil {
 		m.respondErrorWithLog(w, http.StatusBadRequest, err.Error(), log.WithError(err), "failed to decode request registrations")
 		return
 	}
 
-	log = log.WithField("numRegistrations", len(registrations))
+	log = log.WithFields(logrus.Fields{
+		"numRegistrations":   len(registrations),
+		"isTrustedValidator": isTrustedValidator,
+	})
 	span.SetAttributes(
 		attribute.String("method", "registerValidator"),
 		attribute.Int("numRegistrations", len(registrations)),
+		attribute.Bool("isTrustedValidator", isTrustedValidator),
 	)
 	spanContext := trace.ContextWithSpan(req.Context(), span)
 
@@ -818,6 +837,7 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 			activeValidators[registrations[i].Message.Pubkey.PubkeyHex().String()] = &datastore.ValidatorLatency{
 				Registration:   registrations[i],
 				LastRegistered: time.Now().UnixNano(),
+				IsTrusted:      isTrustedValidator,
 			}
 			continue
 		}
@@ -835,6 +855,7 @@ func (m *BoostService) handleRegisterValidator(w http.ResponseWriter, req *http.
 			activeValidators[registrations[i].Message.Pubkey.PubkeyHex().String()] = &datastore.ValidatorLatency{
 				Registration:   registrations[i],
 				LastRegistered: time.Now().UnixNano(),
+				IsTrusted:      isTrustedValidator,
 			}
 		}
 	}
@@ -1163,17 +1184,34 @@ func (m *BoostService) handleGetPayload(w http.ResponseWriter, req *http.Request
 			"stored-payload": fmt.Sprintf("%+v", *getPayloadResponse),
 			"block-hash":     blockHash.String(),
 		})
-		if err := m.publishBlock(payload, getPayloadResponse.Capella.Capella); err != nil {
-			log.WithError(err).WithFields(logrus.Fields{
-				"block-contents": *payload,
-			}).Error("could not publish block")
-			m.respondError(w, http.StatusBadRequest, "failed to publish block")
-			return
-		}
+		isValidatorTrusted := m.datastore.IsValidatorTrusted(context.Background(), pub.PubkeyHex())
+		if isValidatorTrusted {
+			m.respondOK(w, getPayloadResponse.Capella)
+			span.AddEvent("responding with payload, trusted validator")
+			now := time.Now().UTC().UnixMilli()
+			msIntoSlot = now - int64(slotStart)
+			log.WithField("msIntoSlot", msIntoSlot).Info("returning stored payload, trusted validator")
+			go func() {
+				if err := m.publishBlock(payload, getPayloadResponse.Capella.Capella); err != nil {
+					log.WithError(err).WithFields(logrus.Fields{
+						"slot":      fmt.Sprintf("%+v", payload.Message.Slot),
+						"blockHash": blockHash.String(),
+					}).Error("could not publish block")
+				}
+			}()
+		} else {
+			if err := m.publishBlock(payload, getPayloadResponse.Capella.Capella); err != nil {
+				log.WithError(err).WithFields(logrus.Fields{
+					"block-contents": *payload,
+				}).Error("could not publish block")
+				m.respondError(w, http.StatusBadRequest, "failed to publish block")
+				return
+			}
 
-		log.Info("returning stored payload")
-		m.respondOK(w, getPayloadResponse.Capella)
-		span.AddEvent("responding with payload")
+			log.Info("returning stored payload")
+			m.respondOK(w, getPayloadResponse.Capella)
+			span.AddEvent("responding with payload")
+		}
 
 		go func() {
 			log := m.log
@@ -2004,6 +2042,7 @@ func (m *BoostService) StartConfigFilesLoading() {
 // loadConfigFiles loads data from config files
 func (m *BoostService) loadConfigFiles() {
 	go m.loadHighPriorityBuilderData()
+	m.loadTrustedValidatorData()
 }
 
 // isBloxrouteBlock checks block ExtraData to determine if the block was built by bloXroute

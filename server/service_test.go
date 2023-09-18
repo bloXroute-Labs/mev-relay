@@ -24,6 +24,7 @@ import (
 	"github.com/attestantio/go-eth2-client/spec/bellatrix"
 	"github.com/attestantio/go-eth2-client/spec/capella"
 	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/bloXroute-Labs/gateway/v2/utils/syncmap"
 	"github.com/bloXroute-Labs/mev-relay/beaconclient"
 	"github.com/bloXroute-Labs/mev-relay/common"
 	ethCommon "github.com/ethereum/go-ethereum/common"
@@ -105,26 +106,28 @@ func newTestBackendWithRedisPort(t *testing.T, numRelays int, relayTimeout time.
 		backend.relays[i] = newMockRelay(t, blsPrivateKey)
 		relayEntries[i] = backend.relays[i].RelayEntry
 	}
-
+	testTrustedValidatorBearerTokens := syncmap.NewStringMapOf[struct{}]()
+	testTrustedValidatorBearerTokens.Store("bearertoken", struct{}{})
 	opts := BoostServiceOpts{
-		Log:                       testLog,
-		ListenAddr:                "localhost:12345",
-		Relays:                    relayEntries,
-		GenesisForkVersionHex:     "0x00000000",
-		BellatrixForkVersionHex:   "0x00000000",
-		CapellaForkVersionHex:     "0x00000000",
-		GenesisValidatorRootHex:   "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
-		RelayRequestTimeout:       relayTimeout,
-		RelayCheck:                true,
-		MaxHeaderBytes:            4000,
-		IsRelay:                   false,
-		SecretKey:                 nil,
-		PubKey:                    types.PublicKey{},
-		CheckKnownValidators:      false,
-		KnownValidators:           "",
-		RedisURI:                  fmt.Sprintf("localhost:%v", redisPort),
-		DB:                        db,
-		GetPayloadRequestCutoffMs: 0,
+		Log:                          testLog,
+		ListenAddr:                   "localhost:12345",
+		Relays:                       relayEntries,
+		GenesisForkVersionHex:        "0x00000000",
+		BellatrixForkVersionHex:      "0x00000000",
+		CapellaForkVersionHex:        "0x00000000",
+		GenesisValidatorRootHex:      "0x44f1e56283ca88b35c789f7f449e52339bc1fefe3a45913a43a6d16edcd33cf1",
+		RelayRequestTimeout:          relayTimeout,
+		RelayCheck:                   true,
+		MaxHeaderBytes:               4000,
+		IsRelay:                      false,
+		SecretKey:                    nil,
+		PubKey:                       types.PublicKey{},
+		CheckKnownValidators:         false,
+		KnownValidators:              "",
+		RedisURI:                     fmt.Sprintf("localhost:%v", redisPort),
+		DB:                           db,
+		GetPayloadRequestCutoffMs:    0,
+		TrustedValidatorBearerTokens: testTrustedValidatorBearerTokens,
 	}
 	service, err := NewBoostService(opts)
 	require.NoError(t, err)
@@ -180,7 +183,7 @@ func TestNewBoostServiceErrors(t *testing.T) {
 			types.PublicKey{}, "", url.URL{}, url.URL{}, url.URL{},
 			"", false, "", testHighPriorityBuilderPubkeys, testHighPerfSimBuilderPubkeys,
 			&database.MockDB{}, "", "", "", "", "", "", "",
-			"", false, RelayMaxProfit, 80, 0, []string{}, 0, 0, 0, false, trace.NewNoopTracerProvider().Tracer("test")})
+			"", false, RelayMaxProfit, 80, 0, []string{}, 0, 0, 0, false, trace.NewNoopTracerProvider().Tracer("test"), nil})
 		require.Error(t, err)
 	})
 }
@@ -277,12 +280,13 @@ func TestStatus(t *testing.T) {
 
 func TestRegisterValidator(t *testing.T) {
 	path := "/eth/v1/builder/validators"
+	pubKey := _HexToPubkey(
+		"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249")
 	reg := types.SignedValidatorRegistration{
 		Message: &types.RegisterValidatorRequestMessage{
 			FeeRecipient: _HexToAddress("0xdb65fEd33dc262Fe09D9a2Ba8F80b329BA25f941"),
 			Timestamp:    1234356,
-			Pubkey: _HexToPubkey(
-				"0x8a1d7b8dd64e0aafe7ea7b6c95065c9364cf99d38470c12ee807d55f7de1529ad29ce2c422e0b65e3d5a05c02caca249"),
+			Pubkey:       pubKey,
 		},
 		Signature: _HexToSignature(
 			"0x81510b571e22f89d1697545aac01c9ad0c1e7a3e778b3078bef524efae14990e58a6e960a152abd49de2e18d7fd3081c15d5c25867ccfad3d47beef6b39ac24b6b9fbf2cfa91c88f67aff750438a6841ec9e4a06a94ae41410c4f97b75ab284c"),
@@ -294,6 +298,21 @@ func TestRegisterValidator(t *testing.T) {
 		rr := backend.request(t, http.MethodPost, path, payload)
 		time.Sleep(1 * time.Second)
 		require.Equal(t, http.StatusOK, rr.Code)
+	})
+	t.Run("RegisterTrustedValidator", func(t *testing.T) {
+		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
+		rr := backend.requestWithheader(t, http.MethodPost, path, payload, http.Header{"Authorization": []string{"Bearer bearerToken"}})
+		time.Sleep(1 * time.Second)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, true, backend.boost.datastore.IsValidatorTrusted(context.Background(), pubKey.PubkeyHex()))
+	})
+
+	t.Run("RegisterNonTrustedValidator", func(t *testing.T) {
+		backend := newTestBackend(t, 1, time.Second, defaultMockDB)
+		rr := backend.request(t, http.MethodPost, path, payload)
+		time.Sleep(1 * time.Second)
+		require.Equal(t, http.StatusOK, rr.Code)
+		require.Equal(t, false, backend.boost.datastore.IsValidatorTrusted(context.Background(), pubKey.PubkeyHex()))
 	})
 }
 
